@@ -1,0 +1,7 @@
+gpd.ta.appID: 1f8c4d90-7b36-4e21-a509-6d2c83f047b1
+gpd.ta.service_name: kunpeng-tls
+gpd.ta.singleInstance: true
+gpd.ta.multiSession: false
+gpd.ta.instanceKeepAlive: true
+gpd.ta.dataSize: 2097152
+gpd.ta.stackSize: 65536
