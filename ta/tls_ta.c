@@ -1,5 +1,8 @@
 #include <tee_ext_api.h>
 #include <tee_crypto_api.h>
+#include <tee_core_api.h>
+#include <pthread.h>
+
 #include "tls_engine.h"
 #include "tls_protocol.h"
 
@@ -9,7 +12,14 @@ _Static_assert(TLS_FLAG_HANDSHAKE == TLS_PROTOCOL_FLAG_HANDSHAKE &&
     TLS_FLAG_CLOSED == TLS_PROTOCOL_FLAG_CLOSED, "flag contract");
 
 static tls_identity *identity;
-static int session_active;
+static unsigned int session_count;
+static pthread_mutex_t engine_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void unlock_engine(void)
+{
+    if (pthread_mutex_unlock(&engine_mutex) != 0)
+        TEE_Panic(TEE_ERROR_GENERIC);
+}
 
 static int random_bytes(void *context, unsigned char *output, size_t length)
 {
@@ -22,9 +32,14 @@ TEE_Result TA_CreateEntryPoint(void)
 {
     if (addcaller_ca_exec("/vendor/bin/kunpeng-tls-host", "root") != TEE_SUCCESS)
         return TEE_ERROR_GENERIC;
-    if (tls_identity_create(&identity, random_bytes, NULL) != 0)
+    if (pthread_mutex_lock(&engine_mutex) != 0)
         return TEE_ERROR_GENERIC;
-    return TEE_SUCCESS;
+    TEE_Result result = TEE_ERROR_BAD_STATE;
+    if (identity == NULL && session_count == 0)
+        result = tls_identity_create(&identity, random_bytes, NULL) == 0 ?
+            TEE_SUCCESS : TEE_ERROR_GENERIC;
+    unlock_engine();
+    return result;
 }
 
 TEE_Result TA_OpenSessionEntryPoint(uint32_t types, TEE_Param params[4], void **context)
@@ -35,15 +50,22 @@ TEE_Result TA_OpenSessionEntryPoint(uint32_t types, TEE_Param params[4], void **
         TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE))
         return TEE_ERROR_BAD_PARAMETERS;
     *context = NULL;
-    /* Defense against overlapping sessions; not a synchronization primitive.
-     * The TA manifest must enforce single-session execution. */
-    if (session_active)
-        return TEE_ERROR_BUSY;
-    if (tls_connection_create(&connection, identity) != 0)
+    if (pthread_mutex_lock(&engine_mutex) != 0)
         return TEE_ERROR_GENERIC;
-    session_active = 1;
-    *context = connection;
-    return TEE_SUCCESS;
+    TEE_Result result;
+    if (identity == NULL)
+        result = TEE_ERROR_BAD_STATE;
+    else if (session_count >= TLS_MAX_SESSIONS)
+        result = TEE_ERROR_BUSY;
+    else if (tls_connection_create(&connection, identity) != 0)
+        result = TEE_ERROR_GENERIC;
+    else {
+        ++session_count;
+        *context = connection;
+        result = TEE_SUCCESS;
+    }
+    unlock_engine();
+    return result;
 }
 
 TEE_Result TA_InvokeCommandEntryPoint(void *context, uint32_t command,
@@ -66,9 +88,12 @@ TEE_Result TA_InvokeCommandEntryPoint(void *context, uint32_t command,
             params[1].memref.size > TLS_PROTOCOL_CAPACITY ||
             params[1].memref.buffer == NULL)
             return TEE_ERROR_BAD_PARAMETERS;
+        if (pthread_mutex_lock(&engine_mutex) != 0)
+            return TEE_ERROR_GENERIC;
         result = tls_connection_process(context, params[0].memref.buffer,
             params[0].memref.size, params[1].memref.buffer,
             params[1].memref.size, &written, &flags);
+        unlock_engine();
         params[1].memref.size = written;
         params[2].value.a = flags | (result != 0 ?
             TLS_PROTOCOL_FLAG_FATAL | TLS_PROTOCOL_FLAG_CLOSED : 0u);
@@ -80,8 +105,11 @@ TEE_Result TA_InvokeCommandEntryPoint(void *context, uint32_t command,
             params[0].memref.buffer == NULL || params[0].memref.size == 0 ||
             params[0].memref.size > TLS_PROTOCOL_CAPACITY)
             return TEE_ERROR_BAD_PARAMETERS;
+        if (pthread_mutex_lock(&engine_mutex) != 0)
+            return TEE_ERROR_GENERIC;
         result = tls_identity_certificate(identity, params[0].memref.buffer,
             params[0].memref.size, &written);
+        unlock_engine();
         params[0].memref.size = written;
         return result == 0 ? TEE_SUCCESS : TEE_ERROR_GENERIC;
     default:
@@ -92,13 +120,31 @@ TEE_Result TA_InvokeCommandEntryPoint(void *context, uint32_t command,
 void TA_CloseSessionEntryPoint(void *context)
 {
     if (context != NULL) {
+        if (pthread_mutex_lock(&engine_mutex) != 0) {
+            TEE_Panic(TEE_ERROR_GENERIC);
+            return;
+        }
+        if (session_count == 0) {
+            TEE_Panic(TEE_ERROR_BAD_STATE);
+            return;
+        }
         tls_connection_destroy(context);
-        session_active = 0;
+        --session_count;
+        unlock_engine();
     }
 }
 
 void TA_DestroyEntryPoint(void)
 {
+    if (pthread_mutex_lock(&engine_mutex) != 0) {
+        TEE_Panic(TEE_ERROR_GENERIC);
+        return;
+    }
+    if (session_count != 0) {
+        TEE_Panic(TEE_ERROR_BAD_STATE);
+        return;
+    }
     tls_identity_destroy(identity);
     identity = NULL;
+    unlock_engine();
 }
