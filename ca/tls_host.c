@@ -1,4 +1,7 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#include <time.h>
+#include <sys/epoll.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
@@ -7,7 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 #include "tee_client_api.h"
 #include "tls_protocol.h"
@@ -82,12 +84,67 @@ done:
     return status;
 }
 
-static int send_all(int socket_fd, const unsigned char *data, size_t length)
+/* One descriptor is watched at a time: the TA permits only one session. */
+static int wait_ready(int epoll_fd, int socket_fd, uint32_t events)
+{
+    struct epoll_event event = {.events = events, .data.fd = socket_fd};
+    struct timespec now;
+    int64_t deadline;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, socket_fd, &event) != 0) {
+        perror("epoll_ctl modify");
+        return -1;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        perror("clock_gettime");
+        return -1;
+    }
+    deadline = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000 + 15000;
+    for (;;) {
+        int count;
+        int64_t remaining;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            perror("clock_gettime");
+            return -1;
+        }
+        remaining = deadline - ((int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000);
+        if (remaining <= 0)
+            return 0;
+        count = epoll_wait(epoll_fd, &event, 1, (int)remaining);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count < 0)
+            perror("epoll_wait");
+        if (count > 0 && events == EPOLLOUT &&
+            (event.events & (EPOLLERR | EPOLLHUP)) != 0) {
+            fprintf(stderr, "socket closed during output wait\n");
+            return -1;
+        }
+        return count;
+    }
+}
+
+static int watch_socket(int epoll_fd, int socket_fd)
+{
+    struct epoll_event event = {.events = EPOLLIN, .data.fd = socket_fd};
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &event) != 0) {
+        perror("epoll_ctl add");
+        return -1;
+    }
+    return 0;
+}
+
+static int send_all(int epoll_fd, int socket_fd, const unsigned char *data, size_t length)
 {
     while (length != 0) {
         ssize_t sent = send(socket_fd, data, length, MSG_NOSIGNAL);
         if (sent < 0 && errno == EINTR)
             continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (wait_ready(epoll_fd, socket_fd, EPOLLOUT) > 0)
+                continue;
+            fprintf(stderr, "send ciphertext: readiness wait failed or timed out\n");
+            return -1;
+        }
         if (sent <= 0) {
             if (sent < 0)
                 perror("send ciphertext");
@@ -101,7 +158,7 @@ static int send_all(int socket_fd, const unsigned char *data, size_t length)
     return 0;
 }
 
-static void relay(int socket_fd, TEEC_Session *session)
+static void relay(int epoll_fd, int socket_fd, TEEC_Session *session)
 {
     unsigned char input[TLS_PROTOCOL_CAPACITY];
     unsigned char output[TLS_PROTOCOL_CAPACITY];
@@ -133,7 +190,7 @@ static void relay(int socket_fd, TEEC_Session *session)
             fprintf(stderr, "invalid process response\n");
             return;
         }
-        if (send_all(socket_fd, output, length) != 0)
+        if (send_all(epoll_fd, socket_fd, output, length) != 0)
             return;
         fatal |= (flags & TLS_PROTOCOL_FLAG_FATAL) != 0;
         length = 0;
@@ -145,6 +202,12 @@ static void relay(int socket_fd, TEEC_Session *session)
             ssize_t received = recv(socket_fd, input, sizeof(input), 0);
             if (received < 0 && errno == EINTR)
                 continue;
+            if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (wait_ready(epoll_fd, socket_fd, EPOLLIN) > 0)
+                    continue;
+                fprintf(stderr, "receive ciphertext: readiness wait failed or timed out\n");
+                return;
+            }
             if (received <= 0) {
                 if (received < 0)
                     perror("receive ciphertext");
@@ -178,6 +241,7 @@ int main(int argc, char **argv)
     TEEC_Context context = {0};
     TEEC_Result result;
     int listener = -1;
+    int epoll_fd = -1;
     int status = EXIT_FAILURE;
     int option;
     address.sin_family = AF_INET;
@@ -223,7 +287,12 @@ int main(int argc, char **argv)
     context.ta_path = (uint8_t *)ta_path;
     if (export_certificate(&context, certificate_path) != 0)
         goto done;
-    listener = socket(AF_INET, SOCK_STREAM, 0);
+    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd < 0) {
+        perror("epoll_create1");
+        goto done;
+    }
+    listener = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (listener < 0) {
         perror("socket");
         goto done;
@@ -233,32 +302,48 @@ int main(int argc, char **argv)
         perror("bind/listen");
         goto done;
     }
+    if (watch_socket(epoll_fd, listener) != 0)
+        goto done;
     for (;;) {
         TEEC_Session session = {0};
-        struct timeval timeout = {.tv_sec = 15, .tv_usec = 0};
-        int client = accept(listener, NULL, NULL);
+        int client = accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client < 0) {
             if (errno == EINTR)
                 continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (wait_ready(epoll_fd, listener, EPOLLIN) >= 0)
+                    continue;
+                goto done;
+            }
             perror("accept");
             goto done;
         }
-        if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
-            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
-            perror("set socket timeout");
-            close(client);
-            continue;
-        }
-        if (open_session(&context, &session) != 0) {
-            close(client);
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, listener, NULL) != 0) {
+            perror("epoll_ctl delete listener");
+            if (close(client) != 0)
+                perror("close client");
             goto done;
         }
-        relay(client, &session);
+        if (watch_socket(epoll_fd, client) != 0) {
+            if (close(client) != 0)
+                perror("close client");
+            goto done;
+        }
+        if (open_session(&context, &session) != 0) {
+            if (close(client) != 0)
+                perror("close client");
+            goto done;
+        }
+        relay(epoll_fd, client, &session);
         TEEC_CloseSession(&session);
         if (close(client) != 0)
             perror("close client");
+        if (watch_socket(epoll_fd, listener) != 0)
+            goto done;
     }
 done:
+    if (epoll_fd >= 0 && close(epoll_fd) != 0)
+        perror("close epoll");
     if (listener >= 0 && close(listener) != 0)
         perror("close listener");
     TEEC_FinalizeContext(&context);
