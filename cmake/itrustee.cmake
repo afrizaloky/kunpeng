@@ -9,7 +9,7 @@ if(NOT _compiler_headers_result EQUAL 0 OR NOT IS_DIRECTORY "${_compiler_headers
 endif()
 set(_musl "${ITRUSTEE_SDK}/thirdparty/open_source/musl/libc")
 set(_script "${ITRUSTEE_SDK}/build/tools/ta_link_64.ld")
-foreach(required "${_musl}/stdlib.h" "${_script}" "${ITRUSTEE_SDK}/include/TA/tee_internal_api.h")
+foreach(required "${_musl}/stdlib.h" "${_script}" "${ITRUSTEE_SDK}/include/TA/tee_crypto_api.h")
   if(NOT EXISTS "${required}")
     message(FATAL_ERROR "Missing SDK input: ${required}")
   endif()

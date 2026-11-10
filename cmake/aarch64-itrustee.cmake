@@ -1,6 +1,9 @@
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR aarch64)
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+# Nested compiler checks must use the same compiler and Linux sysroot.
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES
+  ITRUSTEE_C_COMPILER ITRUSTEE_LINUX_SYSROOT)
 set(ITRUSTEE_C_COMPILER "aarch64-linux-gnu-gcc" CACHE STRING "AArch64 Linux compiler")
 find_program(_itrustee_cc NAMES "${ITRUSTEE_C_COMPILER}" REQUIRED)
 set(CMAKE_C_COMPILER "${_itrustee_cc}")
