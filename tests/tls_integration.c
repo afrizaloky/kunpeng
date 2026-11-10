@@ -7,6 +7,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <openssl/x509v3.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "line %d: %s\n", __LINE__, #x); ERR_print_errors_fp(stderr); exit(1); } } while (0)
@@ -24,15 +25,33 @@ static int random_bytes(void *context, unsigned char *out, size_t size)
     return 0;
 }
 
+#ifdef TLS_ENGINE_TEST_BIO_CAPACITY
+static size_t saturated_drains;
+#endif
+
 static int exchange(tls_connection *server, SSL *client, unsigned int *flags)
 {
-    unsigned char input[13], output[7];
+#ifdef TLS_ENGINE_TEST_BIO_CAPACITY
+    unsigned char input[TLS_ENGINE_TEST_BIO_CAPACITY];
+    size_t capacity = sizeof(input);
+#else
+    unsigned char input[13];
+    size_t capacity = 7;
+#endif
     size_t written = 0;
     int count = BIO_read(SSL_get_wbio(client), input, sizeof(input));
     if (count < 0) CHECK(BIO_should_retry(SSL_get_wbio(client)));
     int result = tls_connection_process(server, input, count > 0 ? (size_t)count : 0,
-                                        output, sizeof(output), &written, flags);
-    if (written) CHECK(BIO_write(SSL_get_rbio(client), output, (int)written) == (int)written);
+                                        input, capacity, &written, flags);
+#ifdef TLS_ENGINE_TEST_BIO_CAPACITY
+    while (result == 0 && written == capacity) {
+        CHECK(*flags & TLS_FLAG_MORE_OUTPUT);
+        ++saturated_drains;
+        CHECK(BIO_write(SSL_get_rbio(client), input, (int)written) == (int)written);
+        result = tls_connection_process(server, NULL, 0, input, capacity, &written, flags);
+    }
+#endif
+    if (written) CHECK(BIO_write(SSL_get_rbio(client), input, (int)written) == (int)written);
     return result;
 }
 
@@ -124,8 +143,59 @@ static int failing_random(void *context, unsigned char *out, size_t size)
     return -1;
 }
 
+struct random_control { int fail; size_t calls; };
+
+static int controlled_random(void *context, unsigned char *out, size_t size)
+{
+    struct random_control *control = context;
+    ++control->calls;
+    return control->fail ? -1 : random_bytes(NULL, out, size);
+}
+
+static void random_isolation(void)
+{
+    struct random_control first = {0}, second = {0};
+    tls_identity *a = NULL, *b = NULL;
+    tls_connection *server = NULL;
+    unsigned char bytes[4096];
+    size_t written;
+    unsigned int flags;
+    CHECK(tls_identity_create(&a, controlled_random, &first) == 0);
+    CHECK(tls_identity_create(&b, controlled_random, &second) == 0);
+    first.fail = 1;
+    size_t first_calls = first.calls, second_calls = second.calls;
+    CHECK(RAND_bytes(bytes, 32) == 1);
+    CHECK(first.calls == first_calls && second.calls == second_calls);
+    SSL_CTX *context = SSL_CTX_new(TLS_client_method());
+    SSL *client = SSL_new(context);
+    CHECK(context && client);
+    SSL_set_bio(client, BIO_new(BIO_s_mem()), BIO_new(BIO_s_mem()));
+    SSL_set_connect_state(client);
+    CHECK(SSL_do_handshake(client) < 0);
+    int count = BIO_read(SSL_get_wbio(client), bytes, sizeof(bytes));
+    CHECK(count > 0);
+    unsigned char hello[4096];
+    memcpy(hello, bytes, (size_t)count);
+    CHECK(tls_connection_create(&server, a) == 0);
+    int error = tls_connection_process(server, bytes, (size_t)count, NULL, 0, &written, &flags);
+    CHECK(error < 0 && (flags & TLS_FLAG_CLOSED));
+    CHECK(first.calls > first_calls && second.calls == second_calls);
+    CHECK(tls_connection_process(server, NULL, 0, bytes, sizeof(bytes), &written, &flags) == error);
+    tls_connection_destroy(server);
+    CHECK(tls_connection_create(&server, b) == 0);
+    CHECK(tls_connection_process(server, hello, (size_t)count, NULL, 0, &written, &flags) == 0);
+    CHECK(second.calls > second_calls && (flags & TLS_FLAG_MORE_OUTPUT));
+    CHECK(RAND_bytes(bytes, 32) == 1);
+    tls_connection_destroy(server);
+    SSL_free(client);
+    SSL_CTX_free(context);
+    tls_identity_destroy(a);
+    tls_identity_destroy(b);
+}
+
 int main(void)
 {
+    random_isolation();
     tls_identity *identity = NULL;
     CHECK(tls_identity_create(&identity, failing_random, NULL) < 0);
     CHECK(identity == NULL);
@@ -133,8 +203,12 @@ int main(void)
     unsigned char pem[4096];
     size_t size = 0;
     CHECK(tls_identity_certificate(identity, pem, 0, &size) < 0);
-    CHECK(size > 0 && size <= sizeof(pem));
+    CHECK(size > 1 && size <= 2048);
+    size_t required = size;
+    CHECK(tls_identity_certificate(identity, pem, required - 1, &size) < 0);
+    CHECK(size == required);
     CHECK(tls_identity_certificate(identity, pem, sizeof(pem), &size) == 0);
+    CHECK(pem[size - 1] == 0);
     BIO *source = BIO_new_mem_buf(pem, (int)size);
     CHECK(source);
     X509 *certificate = PEM_read_bio_X509(source, NULL, NULL, NULL);
@@ -148,26 +222,53 @@ int main(void)
     static const char valid[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
     static const char nul_method[] = "GE\0T / HTTP/1.1\r\nHost: localhost\r\n\r\n";
     static const char nul_header[] = "GET / HTTP/1.1\r\nHo\0st: localhost\r\n\r\n";
+    char maximum[4096];
+    memset(maximum, 'a', sizeof(maximum));
+    memcpy(maximum, "GET / HTTP/1.1\r\nX: ", 19);
+    memcpy(maximum + sizeof(maximum) - 4, "\r\n\r\n", 4);
+    char excessive[4097];
+    memset(excessive, 'a', sizeof(excessive));
+    memcpy(excessive, "GET / HTTP/1.1\r\nX: ", 19);
+    memcpy(excessive + sizeof(excessive) - 4, "\r\n\r\n", 4);
     const struct request_case requests[] = {
         {valid, sizeof(valid) - 1, 1},
         {nul_method, sizeof(nul_method) - 1, 0},
         {nul_header, sizeof(nul_header) - 1, 0},
+        {maximum, sizeof(maximum), 1},
+        {excessive, sizeof(excessive), 0},
+        {"GET / HTTP/1.1\r\n Fold: bad\r\n\r\n", sizeof("GET / HTTP/1.1\r\n Fold: bad\r\n\r\n") - 1, 0},
     };
     for (unsigned int i = 0; i < 3; ++i) session(identity, context, &requests[0]);
     for (size_t i = 1; i < sizeof(requests) / sizeof(requests[0]); ++i)
         session(identity, context, &requests[i]);
     tls_connection *broken = NULL;
     CHECK(tls_connection_create(&broken, identity) == 0);
-    const unsigned char malformed[] = {0xff, 3, 3, 0, 1, 0};
+    /* A handshake record containing an illegal first handshake message. */
+    const unsigned char malformed[] = {22, 3, 3, 0, 4, 2, 0, 0, 0};
     unsigned char output[64];
     unsigned int flags = 0;
-    CHECK(tls_connection_process(broken, malformed, sizeof(malformed), output, sizeof(output), &size, &flags) < 0);
-    CHECK(flags & TLS_FLAG_CLOSED);
+    int failure = tls_connection_process(broken, malformed, sizeof(malformed), NULL, 0, &size, &flags);
+    CHECK(failure < 0 && size == 0);
+    CHECK((flags & (TLS_FLAG_CLOSED | TLS_FLAG_MORE_OUTPUT)) ==
+          (TLS_FLAG_CLOSED | TLS_FLAG_MORE_OUTPUT));
+    size_t alert_size = 0;
+    do {
+        CHECK(alert_size < sizeof(output));
+        CHECK(tls_connection_process(broken, NULL, 0, output + alert_size, 1, &size, &flags) == failure);
+        CHECK(size == 1 && (flags & TLS_FLAG_CLOSED));
+        alert_size += size;
+    } while (flags & TLS_FLAG_MORE_OUTPUT);
+    CHECK(alert_size == 7 && output[0] == 21 && output[5] == 2);
+    CHECK(tls_connection_process(broken, NULL, 0, output, sizeof(output), &size, &flags) == failure);
+    CHECK(size == 0 && flags == TLS_FLAG_CLOSED);
     tls_connection_destroy(broken);
     CHECK(tls_connection_create(&broken, identity) == 0);
     tls_connection_destroy(broken);
     tls_identity_destroy(identity);
     SSL_CTX_free(context);
-    puts("native OpenSSL/mbedTLS integration passed (not a TEE test)");
+#ifdef TLS_ENGINE_TEST_BIO_CAPACITY
+    CHECK(saturated_drains > 0);
+#endif
+    puts("native OpenSSL integration passed (not a TEE test)");
     return 0;
 }

@@ -2,22 +2,35 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <openssl/core_dispatch.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/provider.h>
+#include <openssl/rand.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 
-#include "mbedtls/ecp.h"
-#include "mbedtls/oid.h"
-#include "mbedtls/pk.h"
-#include "mbedtls/platform_util.h"
-#include "mbedtls/ssl.h"
-#include "mbedtls/x509_crt.h"
+#if OPENSSL_VERSION_NUMBER < 0x30500000L
+#error "The trusted random provider requires OpenSSL 3.5 or newer"
+#endif
 
 #define ENGINE_INVALID (-1)
 #define ENGINE_BOUNDS (-2)
 #define ENGINE_HTTP (-3)
+#define ENGINE_TLS (-4)
 
+#ifndef TLS_ENGINE_TEST_BIO_CAPACITY
+#define TLS_ENGINE_TEST_BIO_CAPACITY TLS_IO_CAPACITY
+#endif
+_Static_assert(TLS_ENGINE_TEST_BIO_CAPACITY > 0 &&
+               TLS_ENGINE_TEST_BIO_CAPACITY <= TLS_IO_CAPACITY, "bounded BIO capacity");
+
+/* SIZE_OK: identity and bounded TLS state machine share one public engine module. */
 struct tls_identity {
-    mbedtls_pk_context key;
-    mbedtls_x509_crt certificate;
-    mbedtls_ssl_config config;
+    OSSL_LIB_CTX *library;
+    OSSL_PROVIDER *provider;
+    OSSL_PROVIDER *defaults;
+    SSL_CTX *config;
     tls_random_fn random;
     void *random_context;
     unsigned char pem[2048];
@@ -25,15 +38,13 @@ struct tls_identity {
 };
 
 struct tls_connection {
-    mbedtls_ssl_context ssl;
-    unsigned char input[TLS_IO_CAPACITY];
-    size_t input_size;
-    unsigned char output[TLS_IO_CAPACITY];
-    size_t output_size;
+    SSL *ssl;
+    BIO *network;
     unsigned char headers[4096];
     size_t header_size;
     size_t response_offset;
     int handshake;
+    int write_pending;
     int state; /* 0: handshake/headers, 1: response, 2: close, 3: closed */
     int error;
 };
@@ -42,112 +53,122 @@ static const unsigned char response[] =
     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n"
     "Connection: close\r\n\r\nHello from the TEE!\n";
 
-static int identity_random(void *context, unsigned char *out, size_t size)
+/* Each built-in provider belongs to exactly one identity's library context.
+ * Its holder is bound before any cryptographic operation can request bytes. */
+static int trusted_random(void *context, int which, void *out, size_t size,
+                          unsigned int strength)
 {
-    tls_identity *identity = context;
-    int ret = identity->random(identity->random_context, out, size);
-    return ret == 0 ? 0 : MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    tls_identity *identity = *(tls_identity **)context;
+    (void)which;
+    if (identity == NULL || strength > 256) { return 0; }
+    if (identity->random(identity->random_context, out, size) == 0) { return 1; }
+    OPENSSL_cleanse(out, size);
+    return 0;
+}
+
+static void random_teardown(void *context) { free(context); }
+
+static int random_provider_init(const OSSL_CORE_HANDLE *handle,
+    const OSSL_DISPATCH *in, const OSSL_DISPATCH **out, void **context)
+{
+    static const OSSL_DISPATCH dispatch[] = {
+        { OSSL_FUNC_PROVIDER_RANDOM_BYTES, (void (*)(void))trusted_random },
+        { OSSL_FUNC_PROVIDER_TEARDOWN, (void (*)(void))random_teardown },
+        { 0, NULL }
+    };
+    (void)handle;
+    (void)in;
+    *context = calloc(1, sizeof(tls_identity *));
+    *out = dispatch;
+    return *context != NULL;
 }
 
 void tls_identity_destroy(tls_identity *identity)
 {
-    if (identity == NULL) {
-        return;
-    }
-    mbedtls_ssl_config_free(&identity->config);
-    mbedtls_x509_crt_free(&identity->certificate);
-    mbedtls_pk_free(&identity->key);
-    mbedtls_platform_zeroize(identity, sizeof(*identity));
+    if (identity == NULL) { return; }
+    SSL_CTX_free(identity->config);
+    OSSL_PROVIDER_unload(identity->provider);
+    OSSL_PROVIDER_unload(identity->defaults);
+    OSSL_LIB_CTX_free(identity->library);
+    OPENSSL_cleanse(identity, sizeof(*identity));
     free(identity);
 }
 
 int tls_identity_create(tls_identity **out, tls_random_fn random, void *context)
 {
     tls_identity *identity;
-    mbedtls_x509write_cert writer;
-    unsigned char serial[16] = { 0 };
-    /* DER GeneralNames containing a single dNSName localhost. */
-    static const unsigned char san[] = {
-        0x30, 0x0b, 0x82, 0x09, 'l', 'o', 'c', 'a', 'l', 'h', 'o', 's', 't'
-    };
-    int ret;
-    if (out == NULL) {
-        return ENGINE_INVALID;
-    }
+    EVP_PKEY *key = NULL;
+    X509 *certificate = NULL;
+    EVP_MD_CTX *signer = NULL;
+    BIO *pem = NULL;
+    BIGNUM *number = NULL;
+    unsigned char serial[16];
+    int ok = 0;
+    if (out == NULL) { return ENGINE_INVALID; }
     *out = NULL;
-    if (random == NULL) {
-        return ENGINE_INVALID;
-    }
+    if (random == NULL) { return ENGINE_INVALID; }
     identity = calloc(1, sizeof(*identity));
-    if (identity == NULL) {
-        return MBEDTLS_ERR_SSL_ALLOC_FAILED;
-    }
+    if (identity == NULL) { return ENGINE_TLS; }
     identity->random = random;
     identity->random_context = context;
-    mbedtls_pk_init(&identity->key);
-    mbedtls_x509_crt_init(&identity->certificate);
-    mbedtls_ssl_config_init(&identity->config);
-    mbedtls_x509write_crt_init(&writer);
-    ret = mbedtls_pk_setup(&identity->key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
-    if (ret == 0) {
-        ret = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1,
-                                  mbedtls_pk_ec(identity->key), identity_random, identity);
+    identity->library = OSSL_LIB_CTX_new();
+    if (identity->library == NULL ||
+        !OSSL_PROVIDER_add_builtin(identity->library, "trusted-random", random_provider_init)) { goto done; }
+    identity->provider = OSSL_PROVIDER_load(identity->library, "trusted-random");
+    if (identity->provider == NULL) { goto done; }
+    *(tls_identity **)OSSL_PROVIDER_get0_provider_ctx(identity->provider) = identity;
+    if (!RAND_set1_random_provider(identity->library, identity->provider)) { goto done; }
+    identity->defaults = OSSL_PROVIDER_load(identity->library, "default");
+    if (identity->defaults == NULL) { goto done; }
+    key = EVP_PKEY_Q_keygen(identity->library, NULL, "EC", "prime256v1");
+    certificate = X509_new_ex(identity->library, NULL);
+    signer = EVP_MD_CTX_new();
+    pem = BIO_new(BIO_s_mem());
+    if (key == NULL || certificate == NULL || signer == NULL || pem == NULL ||
+        !RAND_bytes_ex(identity->library, serial, sizeof(serial), 128)) { goto done; }
+    serial[0] = (unsigned char)((serial[0] & 0x7fu) | 1u);
+    number = BN_bin2bn(serial, sizeof(serial), NULL);
+    if (number == NULL || !BN_to_ASN1_INTEGER(number, X509_get_serialNumber(certificate)) ||
+        !X509_set_version(certificate, 2) || !X509_set_pubkey(certificate, key) ||
+        !ASN1_TIME_set_string(X509_getm_notBefore(certificate), "20240101000000Z") ||
+        !ASN1_TIME_set_string(X509_getm_notAfter(certificate), "20491231235959Z") ||
+        !X509_NAME_add_entry_by_txt(X509_get_subject_name(certificate), "CN", MBSTRING_ASC,
+                                   (const unsigned char *)"localhost", -1, -1, 0) ||
+        !X509_set_issuer_name(certificate, X509_get_subject_name(certificate))) { goto done; }
+    const int extensions[] = { NID_basic_constraints, NID_key_usage, NID_subject_alt_name };
+    const char *values[] = { "critical,CA:FALSE", "critical,digitalSignature", "DNS:localhost" };
+    for (size_t i = 0; i < 3; ++i) {
+        X509_EXTENSION *extension = X509V3_EXT_conf_nid(NULL, NULL, extensions[i], values[i]);
+        if (extension == NULL) { goto done; }
+        int added = X509_add_ext(certificate, extension, -1);
+        X509_EXTENSION_free(extension);
+        if (!added) { goto done; }
     }
-    if (ret == 0) {
-        ret = identity_random(identity, serial, sizeof(serial));
-    }
-    serial[0] = (unsigned char) ((serial[0] & 0x7fu) | 1u);
-    mbedtls_x509write_crt_set_version(&writer, MBEDTLS_X509_CRT_VERSION_3);
-    mbedtls_x509write_crt_set_md_alg(&writer, MBEDTLS_MD_SHA256);
-    mbedtls_x509write_crt_set_subject_key(&writer, &identity->key);
-    mbedtls_x509write_crt_set_issuer_key(&writer, &identity->key);
-    if (ret == 0) {
-        ret = mbedtls_x509write_crt_set_serial_raw(&writer, serial, sizeof(serial));
-    }
-    if (ret == 0) {
-        ret = mbedtls_x509write_crt_set_subject_name(&writer, "CN=localhost");
-    }
-    if (ret == 0) {
-        ret = mbedtls_x509write_crt_set_issuer_name(&writer, "CN=localhost");
-    }
-    if (ret == 0) {
-        ret = mbedtls_x509write_crt_set_validity(&writer, "20240101000000", "20491231235959");
-    }
-    if (ret == 0) {
-        ret = mbedtls_x509write_crt_set_basic_constraints(&writer, 0, -1);
-    }
-    if (ret == 0) {
-        ret = mbedtls_x509write_crt_set_key_usage(&writer, MBEDTLS_X509_KU_DIGITAL_SIGNATURE);
-    }
-    if (ret == 0) {
-        ret = mbedtls_x509write_crt_set_extension(&writer, MBEDTLS_OID_SUBJECT_ALT_NAME,
-                MBEDTLS_OID_SIZE(MBEDTLS_OID_SUBJECT_ALT_NAME), 0, san, sizeof(san));
-    }
-    if (ret == 0) {
-        ret = mbedtls_x509write_crt_pem(&writer, identity->pem, sizeof(identity->pem),
-                                       identity_random, identity);
-    }
-    if (ret == 0) {
-        identity->pem_size = strlen((const char *) identity->pem) + 1;
-        ret = mbedtls_x509_crt_parse(&identity->certificate, identity->pem, identity->pem_size);
-    }
-    if (ret == 0) {
-        ret = mbedtls_ssl_config_defaults(&identity->config, MBEDTLS_SSL_IS_SERVER,
-                                          MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
-    }
-    if (ret == 0) {
-        mbedtls_ssl_conf_rng(&identity->config, identity_random, identity);
-        mbedtls_ssl_conf_authmode(&identity->config, MBEDTLS_SSL_VERIFY_NONE);
-        mbedtls_ssl_conf_min_tls_version(&identity->config, MBEDTLS_SSL_VERSION_TLS1_2);
-        mbedtls_ssl_conf_max_tls_version(&identity->config, MBEDTLS_SSL_VERSION_TLS1_2);
-        ret = mbedtls_ssl_conf_own_cert(&identity->config, &identity->certificate, &identity->key);
-    }
-    mbedtls_x509write_crt_free(&writer);
-    mbedtls_platform_zeroize(serial, sizeof(serial));
-    if (ret != 0) {
-        tls_identity_destroy(identity);
-        return ret;
-    }
+    if (!EVP_DigestSignInit_ex(signer, NULL, "SHA256", identity->library, NULL, key, NULL) ||
+        !X509_sign_ctx(certificate, signer) || !PEM_write_bio_X509(pem, certificate)) { goto done; }
+    size_t length = BIO_ctrl_pending(pem);
+    if (length >= sizeof(identity->pem) ||
+        BIO_read(pem, identity->pem, (int)length) != (int)length) { goto done; }
+    identity->pem_size = length + 1;
+    identity->config = SSL_CTX_new_ex(identity->library, NULL, TLS_server_method());
+    if (identity->config == NULL ||
+        !SSL_CTX_set_min_proto_version(identity->config, TLS1_2_VERSION) ||
+        !SSL_CTX_set_max_proto_version(identity->config, TLS1_2_VERSION) ||
+        !SSL_CTX_set_cipher_list(identity->config, "ECDHE-ECDSA-AES128-GCM-SHA256") ||
+        !SSL_CTX_set1_groups_list(identity->config, "P-256") ||
+        !SSL_CTX_use_certificate(identity->config, certificate) ||
+        !SSL_CTX_use_PrivateKey(identity->config, key)) { goto done; }
+    SSL_CTX_set_options(identity->config, SSL_OP_NO_TICKET | SSL_OP_NO_RENEGOTIATION);
+    SSL_CTX_set_session_cache_mode(identity->config, SSL_SESS_CACHE_OFF);
+    ok = 1;
+done:
+    OPENSSL_cleanse(serial, sizeof(serial));
+    BN_free(number);
+    BIO_free(pem);
+    EVP_MD_CTX_free(signer);
+    X509_free(certificate);
+    EVP_PKEY_free(key);
+    if (!ok) { tls_identity_destroy(identity); return ENGINE_TLS; }
     *out = identity;
     return 0;
 }
@@ -155,96 +176,53 @@ int tls_identity_create(tls_identity **out, tls_random_fn random, void *context)
 int tls_identity_certificate(tls_identity *identity, unsigned char *out,
                              size_t capacity, size_t *written)
 {
-    if (written == NULL) {
-        return ENGINE_INVALID;
-    }
+    if (written == NULL) { return ENGINE_INVALID; }
     *written = 0;
-    if (identity == NULL || (out == NULL && capacity != 0)) {
-        return ENGINE_INVALID;
-    }
+    if (identity == NULL || (out == NULL && capacity != 0)) { return ENGINE_INVALID; }
     *written = identity->pem_size;
-    if (capacity < identity->pem_size) {
-        return ENGINE_BOUNDS;
-    }
-    if (out == NULL) {
-        return ENGINE_INVALID;
-    }
+    if (capacity < identity->pem_size) { return ENGINE_BOUNDS; }
+    if (out == NULL) { return ENGINE_INVALID; }
     memcpy(out, identity->pem, identity->pem_size);
     return 0;
 }
 
-static int send_ciphertext(void *context, const unsigned char *data, size_t size)
-{
-    tls_connection *connection = context;
-    size_t available = TLS_IO_CAPACITY - connection->output_size;
-    if (available == 0) {
-        return MBEDTLS_ERR_SSL_WANT_WRITE;
-    }
-    if (size > available) {
-        size = available;
-    }
-    memcpy(connection->output + connection->output_size, data, size);
-    connection->output_size += size;
-    return (int) size;
-}
-
-static int receive_ciphertext(void *context, unsigned char *data, size_t size)
-{
-    tls_connection *connection = context;
-    if (connection->input_size == 0) {
-        return MBEDTLS_ERR_SSL_WANT_READ;
-    }
-    if (size > connection->input_size) {
-        size = connection->input_size;
-    }
-    memcpy(data, connection->input, size);
-    connection->input_size -= size;
-    memmove(connection->input, connection->input + size, connection->input_size);
-    return (int) size;
-}
-
 void tls_connection_destroy(tls_connection *connection)
 {
-    if (connection != NULL) {
-        mbedtls_ssl_free(&connection->ssl);
-        mbedtls_platform_zeroize(connection, sizeof(*connection));
-        free(connection);
-    }
+    if (connection == NULL) { return; }
+    SSL_free(connection->ssl);
+    BIO_free(connection->network);
+    OPENSSL_cleanse(connection, sizeof(*connection));
+    free(connection);
 }
 
 int tls_connection_create(tls_connection **out, tls_identity *identity)
 {
     tls_connection *connection;
-    int ret;
-    if (out == NULL) {
-        return ENGINE_INVALID;
-    }
+    BIO *transport = NULL;
+    if (out == NULL) { return ENGINE_INVALID; }
     *out = NULL;
-    if (identity == NULL) {
-        return ENGINE_INVALID;
-    }
+    if (identity == NULL) { return ENGINE_INVALID; }
     connection = calloc(1, sizeof(*connection));
-    if (connection == NULL) {
-        return MBEDTLS_ERR_SSL_ALLOC_FAILED;
-    }
-    mbedtls_ssl_init(&connection->ssl);
-    ret = mbedtls_ssl_setup(&connection->ssl, &identity->config);
-    if (ret != 0) {
+    if (connection == NULL) { return ENGINE_TLS; }
+    connection->ssl = SSL_new(identity->config);
+    if (connection->ssl == NULL ||
+        !BIO_new_bio_pair(&transport, TLS_ENGINE_TEST_BIO_CAPACITY,
+                          &connection->network, TLS_IO_CAPACITY)) {
         tls_connection_destroy(connection);
-        return ret;
+        return ENGINE_TLS;
     }
-    mbedtls_ssl_set_bio(&connection->ssl, connection, send_ciphertext, receive_ciphertext, NULL);
+    SSL_set_bio(connection->ssl, transport, transport);
+    SSL_set_accept_state(connection->ssl);
     *out = connection;
     return 0;
 }
 
-/* A deliberately small HTTP header grammar: token method/field names,
- * nonempty visible request target, HTTP/1.0 or 1.1, CRLF lines, no obs-fold. */
+/* Token method/field names, visible target, HTTP/1.0 or 1.1, no obs-fold. */
 static int token(unsigned char c)
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
            (c >= '0' && c <= '9') ||
-           (c != 0 && strchr("!#$%&'*+-.^_`|~", (int) c) != NULL);
+           (c != 0 && strchr("!#$%&'*+-.^_`|~", (int)c) != NULL);
 }
 
 static int valid_headers(const unsigned char *data, size_t size)
@@ -274,53 +252,53 @@ static int valid_headers(const unsigned char *data, size_t size)
     return size - i == 2 && data[i] == '\r' && data[i + 1] == '\n';
 }
 
+static int ssl_result(tls_connection *connection, int result)
+{
+    int error = SSL_get_error(connection->ssl, result);
+    connection->write_pending = error == SSL_ERROR_WANT_WRITE;
+    return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ? 0 : ENGINE_TLS;
+}
+
 static int advance(tls_connection *connection)
 {
     int ret;
     for (;;) {
+        ERR_clear_error();
         if (!connection->handshake) {
-            ret = mbedtls_ssl_handshake(&connection->ssl);
-            if (ret != 0) { return ret; }
+            ret = SSL_do_handshake(connection->ssl);
+            if (ret != 1) { return ssl_result(connection, ret); }
             connection->handshake = 1;
         }
         if (connection->state == 0) {
             unsigned char byte;
-            ret = mbedtls_ssl_read(&connection->ssl, &byte, 1);
+            ret = SSL_read(connection->ssl, &byte, 1);
             if (ret <= 0) {
-                if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                if (SSL_get_error(connection->ssl, ret) == SSL_ERROR_ZERO_RETURN) {
                     connection->state = 2;
                     continue;
                 }
-                return ret;
+                return ssl_result(connection, ret);
             }
             connection->headers[connection->header_size++] = byte;
             if (connection->header_size >= 4 &&
                 memcmp(connection->headers + connection->header_size - 4, "\r\n\r\n", 4) == 0) {
-                if (!valid_headers(connection->headers, connection->header_size)) {
-                    return ENGINE_HTTP;
-                }
-                mbedtls_platform_zeroize(connection->headers, sizeof(connection->headers));
+                if (!valid_headers(connection->headers, connection->header_size)) { return ENGINE_HTTP; }
+                OPENSSL_cleanse(connection->headers, sizeof(connection->headers));
                 connection->state = 1;
-            } else if (connection->header_size == sizeof(connection->headers)) {
-                return ENGINE_HTTP;
-            }
+            } else if (connection->header_size == sizeof(connection->headers)) { return ENGINE_HTTP; }
         } else if (connection->state == 1) {
-            /* Offset changes only after success: identical retry arguments. */
-            ret = mbedtls_ssl_write(&connection->ssl, response + connection->response_offset,
-                                    sizeof(response) - 1 - connection->response_offset);
-            if (ret <= 0) { return ret == 0 ? MBEDTLS_ERR_SSL_INTERNAL_ERROR : ret; }
-            connection->response_offset += (size_t) ret;
-            if (connection->response_offset == sizeof(response) - 1) {
-                connection->state = 2;
-            }
+            ret = SSL_write(connection->ssl, response + connection->response_offset,
+                            (int)(sizeof(response) - 1 - connection->response_offset));
+            if (ret <= 0) { return ssl_result(connection, ret); }
+            connection->response_offset += (size_t)ret;
+            if (connection->response_offset == sizeof(response) - 1) { connection->state = 2; }
         } else if (connection->state == 2) {
-            ret = mbedtls_ssl_close_notify(&connection->ssl);
-            if (ret != 0) { return ret; }
+            ret = SSL_shutdown(connection->ssl);
+            /* One-way close: do not wait for the peer's close_notify. */
+            if (ret < 0) { return ssl_result(connection, ret); }
             connection->state = 3;
             return 0;
-        } else {
-            return 0;
-        }
+        } else { return 0; }
     }
 }
 
@@ -329,36 +307,36 @@ int tls_connection_process(tls_connection *connection,
                            unsigned char *output, size_t capacity,
                            size_t *written, unsigned int *flags)
 {
-    int ret;
-    size_t count;
     if (written == NULL || flags == NULL) { return ENGINE_INVALID; }
     *written = 0;
     *flags = 0;
     if (connection == NULL || (input == NULL && input_size != 0) ||
         (output == NULL && capacity != 0)) { return ENGINE_INVALID; }
-    if (input_size > TLS_IO_CAPACITY - connection->input_size) { return ENGINE_BOUNDS; }
+    if (input_size > BIO_ctrl_get_write_guarantee(connection->network)) { return ENGINE_BOUNDS; }
     if (connection->state == 3 && input_size != 0) { return ENGINE_INVALID; }
-    if (input_size != 0) {
-        memcpy(connection->input + connection->input_size, input, input_size);
-        connection->input_size += input_size;
+    /* Copy all input before writing output, including when buffers overlap. */
+    if (input_size != 0 && BIO_write(connection->network, input, (int)input_size) != (int)input_size) {
+        return ENGINE_TLS;
     }
     if (connection->state != 3) {
-        ret = advance(connection);
-        if (ret != 0 && ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            connection->error = ret;
+        connection->write_pending = 0;
+        connection->error = advance(connection);
+        if (connection->error != 0) {
             connection->state = 3;
-            mbedtls_platform_zeroize(connection->headers, sizeof(connection->headers));
+            OPENSSL_cleanse(connection->headers, sizeof(connection->headers));
         }
     }
-    count = connection->output_size < capacity ? connection->output_size : capacity;
+    size_t count = BIO_ctrl_pending(connection->network);
+    if (count > capacity) { count = capacity; }
     if (count != 0) {
-        memcpy(output, connection->output, count);
-        connection->output_size -= count;
-        memmove(connection->output, connection->output + count, connection->output_size);
+        int read = BIO_read(connection->network, output, (int)count);
+        if (read > 0) { *written = (size_t)read; }
     }
-    *written = count;
     if (connection->handshake) { *flags |= TLS_FLAG_HANDSHAKE; }
-    if (connection->output_size != 0) { *flags |= TLS_FLAG_MORE_OUTPUT; }
+    if (BIO_ctrl_pending(connection->network) != 0 ||
+        (connection->state != 3 && connection->write_pending)) {
+        *flags |= TLS_FLAG_MORE_OUTPUT;
+    }
     if (connection->state == 3) { *flags |= TLS_FLAG_CLOSED; }
     return connection->error;
 }

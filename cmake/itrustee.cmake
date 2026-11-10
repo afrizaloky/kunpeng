@@ -25,15 +25,23 @@ target_include_directories(itrustee_trusted INTERFACE
 target_compile_options(itrustee_trusted INTERFACE -nostdinc -march=armv8-a -Os
   -fPIC -fno-short-enums -fno-omit-frame-pointer -fstack-protector-strong
   -fno-common -fsigned-char -Wall -Wextra -Werror)
-foreach(lib tls_engine mbedtls mbedx509 mbedcrypto everest p256m)
+foreach(lib tls_engine)
   target_link_libraries(${lib} PRIVATE itrustee_trusted)
 endforeach()
-add_library(tls_ta SHARED ta/tls_ta.c)
+add_library(tls_ta SHARED ta/tls_ta.c ta/openssl_platform.c)
+target_compile_options(tls_ta PRIVATE -mno-outline-atomics)
+execute_process(COMMAND "${CMAKE_C_COMPILER}" -print-libgcc-file-name
+  OUTPUT_VARIABLE _libgcc OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+target_link_libraries(tls_ta PRIVATE tls_engine OpenSSL::SSL OpenSSL::Crypto "${_libgcc}")
 target_link_libraries(tls_ta PRIVATE tls_engine itrustee_trusted)
 target_link_options(tls_ta PRIVATE -nostdlib -shared "-Wl,-T,${_script}"
   -Wl,-z,text,-z,now,-z,relro,-z,noexecstack,-z,max-page-size=0x1000,-z,common-page-size=0x1000)
 set_target_properties(tls_ta PROPERTIES OUTPUT_NAME combine LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ta/unsigned")
 configure_file(ta/manifest.txt ta/unsigned/manifest.txt COPYONLY)
+add_custom_command(TARGET tls_ta POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -DNM=${CMAKE_NM} -DBINARY=$<TARGET_FILE:tls_ta>
+    -DSDK=${ITRUSTEE_SDK} -P ${PROJECT_SOURCE_DIR}/cmake/check-ta-imports.cmake
+  VERBATIM)
 message(STATUS "TA output: ta/unsigned/libcombine.so (UNSIGNED; not deployable .sec)")
 if(KUNPENG_SIGN_TA)
   set(ITRUSTEE_SIGN_PRIVATE_CONFIG "" CACHE FILEPATH "Caller-owned signtool private INI")
