@@ -1,6 +1,6 @@
 # kunpeng-tls
 
-A small TLS 1.2 server split between a Linux Client Application (CA) and an iTrustee Trusted Application (TA). The CA accepts a TCP connection and passes encrypted records to the TA through the iTrustee client API. The TA owns the TLS identity, handshake and record processing, using the bundled Mbed TLS engine. The current server responds with the fixed body `Hello from the TEE!`.
+A small TLS 1.2 server split between a Linux Client Application (CA) and an iTrustee Trusted Application (TA). The CA accepts a TCP connection and passes encrypted records to the TA through the iTrustee client API. The TA owns the TLS identity, handshake and record processing, using OpenSSL 3.5. The current server responds with the fixed body `Hello from the TEE!`.
 
 ## Status and limits
 
@@ -11,7 +11,8 @@ This is a minimal demonstration, not a production service. It has no mutual TLS,
 ## Prerequisites
 
 - Git with recursive submodule support, CMake 3.20 or newer, and a C compiler.
-- For native tests on Linux: OpenSSL development files and the OpenSSL CLI.
+- For native tests on Linux: OpenSSL 3.5 or newer development files and the OpenSSL CLI.
+- For the TA: Perl, GNU make, and a pristine local `openssl-3.5.0.tar.gz` source archive. CMake verifies SHA-256 `344d0a79f1a9b08029b0744e2cc401a43f9c90acd1044d09a530b4885a8e9fc0`. The tested input is `/home/afrizal/Documents/Workspace/Github/SGX-CMake/third_party/intel-sgx-ssl/openssl_source/openssl-3.5.0.tar.gz`. The adjacent extracted SGX tree is patched and must not be used; no external source tree or x86 archive is modified or linked.
 - For the iTrustee build: the Huawei iTrustee SDK as the `third_party/itrustee_sdk` submodule, an AArch64 Linux cross-compiler, and the SDK inputs checked by CMake, including the TA linker script, TA headers and SDK musl headers. The upstream SDK's general sample-build instructions also list `libboundscheck`; this project's sources do not currently call it, and CMake does not check or fetch it. If your SDK variant needs it, provision the matching dependency according to that SDK's instructions.
 - For the CA at runtime: the target iTrustee environment and its `/usr/lib64/libteec.so` runtime library. The project compiles the SDK CA adaptor, but does not package or provide the target runtime library or the iTrustee service infrastructure.
 - For signing: Python 3, the SDK signer dependencies `pycryptodome` and `gmssl`, and the OpenSSL CLI used by the signer. You also need your own signing private key and Huawei-signed configuration/trust chain. The SDK's `config_cloud.ini` is a reference only. Do not copy its example key material or invent credentials.
@@ -20,7 +21,7 @@ No package manager or installation command is assumed here because the correct s
 
 ## Get the source
 
-Replace `<repository-url>` below with this project's Git URL. Clone with submodules so Mbed TLS and the iTrustee SDK are present:
+Replace `<repository-url>` below with this project's Git URL. Clone with submodules so the iTrustee SDK is present. OpenSSL TA sources are supplied separately as a local archive:
 
 ```sh
 git clone --recurse-submodules <repository-url>
@@ -57,6 +58,7 @@ On an x86 Linux build machine with the AArch64 GNU cross compiler available as `
 cmake -S . -B build/aarch64 \
   -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-itrustee.cmake \
   -DKUNPENG_BUILD_ITRUSTEE=ON \
+  -DKUNPENG_OPENSSL_ARCHIVE=/home/afrizal/Documents/Workspace/Github/SGX-CMake/third_party/intel-sgx-ssl/openssl_source/openssl-3.5.0.tar.gz \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build/aarch64 --parallel
 ```
@@ -70,6 +72,7 @@ cmake -S . -B build/aarch64 \
   -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-itrustee.cmake \
   -DITRUSTEE_C_COMPILER=gcc \
   -DKUNPENG_BUILD_ITRUSTEE=ON \
+  -DKUNPENG_OPENSSL_ARCHIVE=/home/afrizal/Documents/Workspace/Github/SGX-CMake/third_party/intel-sgx-ssl/openssl_source/openssl-3.5.0.tar.gz \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build/aarch64 --parallel
 ```
@@ -80,6 +83,10 @@ Expected outputs:
 
 - `build/aarch64/kunpeng-tls-host`: AArch64 Linux CA executable.
 - `build/aarch64/ta/unsigned/libcombine.so` and `build/aarch64/ta/unsigned/manifest.txt`: unsigned TA build inputs. `libcombine.so` is **not deployable**. Do not copy it to the device as a TA.
+
+The TA builds static OpenSSL libssl/libcrypto from pristine sources in the build directory, with `no-sock no-posix-io no-stdio no-dso no-shared no-threads no-module` and `--with-rand-seed=none`. It keeps SDK-only `-nostdinc` compilation and `-nostdlib` linking. Build-local compatibility patches disable directory enumeration and inherited process environment, use OpenSSL's portable aligned allocator, and remove unused Linux entropy-header dependencies. No host TLS library is linked into the TA or CA.
+
+The platform adapter maps clocks to SDK `get_sys_rtc_time`/`TEE_GetSystemTime` and waits to `TEE_Wait`; filesystem queries fail explicitly with ENOSYS. RTC accuracy and trust require device validation. The engine must register its per-identity builtin entropy provider before generating keys or TLS randomness; this build deliberately provides no OS entropy fallback. The post-link check rejects imports absent from SDK headers, apart from SDK sample stack-protector hooks; compiler arithmetic helpers are linked from the matching AArch64 libgcc. Header declarations are not proof of the target loader's exports: signing, loader acceptance, entropy behavior, and the manifest's 2 MiB heap/64 KiB stack budget remain unverified on device.
 
 The configured TA UUID is `1f8c4d90-7b36-4e21-a509-6d2c83f047b1`.
 
@@ -93,6 +100,7 @@ Configure and build with signing enabled:
 cmake -S . -B build/aarch64 \
   -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-itrustee.cmake \
   -DKUNPENG_BUILD_ITRUSTEE=ON \
+  -DKUNPENG_OPENSSL_ARCHIVE=/home/afrizal/Documents/Workspace/Github/SGX-CMake/third_party/intel-sgx-ssl/openssl_source/openssl-3.5.0.tar.gz \
   -DKUNPENG_SIGN_TA=ON \
   -DITRUSTEE_SIGN_PRIVATE_CONFIG=/absolute/path/to/your/authorized-signing-config.ini \
   -DCMAKE_BUILD_TYPE=Release
