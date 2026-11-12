@@ -1,6 +1,6 @@
 # kunpeng-tls
 
-A small TLS 1.2/1.3 server split between a Linux Client Application (CA) and an iTrustee Trusted Application (TA). The CA accepts a TCP connection and passes encrypted records to the TA through the iTrustee client API. The TA owns the TLS identity, handshake and record processing, using OpenSSL 3.5. The current server responds with the fixed body `Hello from the TEE!`.
+A small TLS 1.2/1.3 server split between a Linux Client Application (CA) and an iTrustee Trusted Application (TA). The CA accepts a TCP connection and passes encrypted records to the TA through the iTrustee client API. The TA owns the TLS identity, handshake and record processing, using OpenSSL 3.5. Bodyless GET requests receive the fixed response `Hello from the TEE!`; a bodyless POST to `/` demonstrates a bounded host-data exchange over TLS.
 
 ## Status and limits
 
@@ -163,14 +163,27 @@ The single-request OpenSSL example sends `Connection: close` to request connecti
 
 HTTP/1.1 connections are persistent by default for sequential requests. A `close` token in the `Connection` header requests closure after the response; header names and connection tokens are case-insensitive, including `close` within a comma-separated token list. HTTP/1.0 connections close after the response, even when keep-alive is requested. This supports sequential HTTP/1.1 requests, not HTTP/2 or HTTP pipelining.
 
-Only bodyless `GET` requests are supported. `Content-Length` must be absent or occur exactly once with a valid decimal value of zero. Requests with `Transfer-Encoding`, a nonzero or invalid `Content-Length`, or duplicate `Content-Length` headers are rejected and the connection is closed rather than consuming a request body.
+Bodyless `GET` requests remain unchanged. `Content-Length` may be absent or occur exactly once with a valid decimal value of zero. The only supported POST is a bodyless `POST /` with exactly one `Content-Length: 0`. POST to any other path, any request body, and any `Transfer-Encoding` are unsupported; invalid or duplicate `Content-Length` headers are rejected and the connection is closed. No request body is forwarded to the CA.
+
+The demo POST causes the TA to request the fixed public data `Public demo data from CA.\n`. The TA parses the request and issues a `HOST_REQUEST` containing operation `DEMO_DATA` and its request ID. The CA supplies the public data with `TLS_CMD_SUPPLY_HOST_DATA=3`; existing `PROCESS=1` and `CERTIFICATE=2` commands remain. Only operation/ID metadata crosses from TA to CA, not plaintext HTTP. The returned host data goes back to the TA, where it is copied and checked as 1 to 128 printable ASCII bytes or LF. CR, NUL and other control bytes are rejected, as are replayed operation/ID pairs. The TA builds the bounded HTTP response and encrypts it with TLS.
+
+Host-supplied response data is untrusted input, not an authenticated key record. The TA does not rely on it for authorization. This is a fixed demo callback, not an arbitrary filesystem, network or request-body service. There can be only one pending request per connection, and each worker invocation performs at most one host dispatch; it does not recursively request more host work. Existing GET keep-alive and explicit-close behavior is preserved. The existing eight-session limit also remains; the POST does not increase it.
 
 Persistent connections do not change the eight-session cap or host deadlines: eight persistent connections hold all eight TA sessions, including while idle, until they close or time out. The default handshake deadline and idle timeout remain 15 seconds each.
 
-The expected response is:
+For the existing GET response, the expected body remains:
 
 ```text
 Hello from the TEE!
+```
+
+To request the demo host-data response, use exactly this bodyless POST:
+
+```sh
+curl --cacert /var/tmp/kunpeng-tls-server.pem \
+  --request POST \
+  --header 'Content-Length: 0' \
+  https://localhost:8443/
 ```
 
 Do not use `curl -k`. The certificate is self-signed and the host exports it from the TA. It is not attestation. Before trusting it, obtain and verify its fingerprint through an independent trusted channel. `--cacert` makes this test trust the exported certificate; it does not establish that the certificate belongs to a known or attested device.
