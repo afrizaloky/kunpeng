@@ -52,11 +52,16 @@ struct tls_identity {
     void *random_context;
     unsigned char pem[2048];
     size_t pem_size;
+    uint32_t next_request_id;
 };
 
 struct tls_connection {
     SSL *ssl;
     BIO *network;
+    tls_identity *identity;
+    tls_host_data_request pending;
+    unsigned char host_response[256];
+    size_t host_response_size;
     unsigned char headers[4096];
     size_t header_size;
     size_t response_offset;
@@ -263,6 +268,7 @@ int tls_connection_create(tls_connection **out, tls_identity *identity)
         TLS_ENGINE_LOG_ERROR("connection-allocation");
         return ENGINE_TLS;
     }
+    connection->identity = identity;
     connection->ssl = SSL_new(identity->config);
     if (connection->ssl == NULL) {
         TLS_ENGINE_LOG_ERROR("connection-ssl");
@@ -307,7 +313,8 @@ static int valid_headers(tls_connection *connection)
     size_t i = 0;
     size_t start;
     int content_length = 0;
-    if (size < 4 || memcmp(data, "GET ", 4) != 0) { return 0; }
+    int post = size >= 7 && memcmp(data, "POST / ", 7) == 0;
+    if (!post && (size < 4 || memcmp(data, "GET ", 4) != 0)) { return 0; }
     while (i < size && token(data[i])) { ++i; }
     if (i == 0 || i >= size || data[i++] != ' ') { return 0; }
     start = i;
@@ -355,7 +362,49 @@ static int valid_headers(tls_connection *connection)
         }
         i += 2;
     }
-    return size - i == 2 && data[i] == '\r' && data[i + 1] == '\n';
+    if (size - i != 2 || data[i] != '\r' || data[i + 1] != '\n' ||
+        (post && content_length != 1)) { return 0; }
+    return post ? 2 : 1;
+}
+
+int tls_connection_host_request(const tls_connection *connection, tls_host_data_request *request)
+{
+    if (connection == NULL || request == NULL) { return ENGINE_INVALID; }
+    *request = connection->pending;
+    return 0;
+}
+
+int tls_connection_supply_host_data(tls_connection *connection,
+    const tls_host_data_request *request, const unsigned char *data, size_t size)
+{
+    if (connection == NULL || request == NULL || data == NULL || size == 0 ||
+        size > TLS_HOST_DATA_CAPACITY || connection->state != 4 ||
+        request->operation != TLS_HOST_OP_DEMO_DATA || request->id == 0 ||
+        request->id != connection->pending.id ||
+        request->operation != connection->pending.operation) { return ENGINE_INVALID; }
+    unsigned char public_data[TLS_HOST_DATA_CAPACITY];
+    memcpy(public_data, data, size);
+    for (size_t i = 0; i < size; ++i) {
+        if (public_data[i] != '\n' && (public_data[i] < 0x20 || public_data[i] > 0x7e)) {
+            return ENGINE_INVALID;
+        }
+    }
+    static const char prefix[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ";
+    unsigned char *out = connection->host_response;
+    size_t used = sizeof(prefix) - 1;
+    memcpy(out, prefix, used);
+    if (size >= 100) { out[used++] = (unsigned char)('0' + size / 100); }
+    if (size >= 10) { out[used++] = (unsigned char)('0' + (size / 10) % 10); }
+    out[used++] = (unsigned char)('0' + size % 10);
+    const char *ending = connection->close_after_response ? "\r\nConnection: close\r\n\r\n" : "\r\n\r\n";
+    size_t ending_size = strlen(ending);
+    memcpy(out + used, ending, ending_size);
+    used += ending_size;
+    memcpy(out + used, public_data, size);
+    connection->host_response_size = used + size;
+    connection->pending = (tls_host_data_request){0, 0};
+    connection->state = 1;
+    return 0;
 }
 
 static int ssl_result(tls_connection *connection, int result)
@@ -388,13 +437,25 @@ static int advance(tls_connection *connection)
             connection->headers[connection->header_size++] = byte;
             if (connection->header_size >= 4 &&
                 memcmp(connection->headers + connection->header_size - 4, "\r\n\r\n", 4) == 0) {
-                if (!valid_headers(connection)) { return ENGINE_HTTP; }
+                int kind = valid_headers(connection);
+                if (kind == 0) { return ENGINE_HTTP; }
                 OPENSSL_cleanse(connection->headers, sizeof(connection->headers));
+                if (kind == 2) {
+                    if (connection->identity->next_request_id == UINT32_MAX) { return ENGINE_HTTP; }
+                    connection->pending.operation = TLS_HOST_OP_DEMO_DATA;
+                    connection->pending.id = ++connection->identity->next_request_id;
+                    connection->state = 4;
+                    return 0;
+                }
                 connection->state = 1;
             } else if (connection->header_size == sizeof(connection->headers)) { return ENGINE_HTTP; }
         } else if (connection->state == 1) {
             const unsigned char *bytes = connection->close_after_response ? response : persistent_response;
             size_t size = connection->close_after_response ? sizeof(response) - 1 : sizeof(persistent_response) - 1;
+            if (connection->host_response_size != 0) {
+                bytes = connection->host_response;
+                size = connection->host_response_size;
+            }
             ret = SSL_write(connection->ssl, bytes + connection->response_offset,
                              (int)(size - connection->response_offset));
             if (ret <= 0) { return ssl_result(connection, ret); }
@@ -403,6 +464,8 @@ static int advance(tls_connection *connection)
                 connection->state = connection->close_after_response ? 2 : 0;
                 connection->header_size = 0;
                 connection->response_offset = 0;
+                connection->host_response_size = 0;
+                OPENSSL_cleanse(connection->host_response, sizeof(connection->host_response));
                 connection->close_after_response = 0;
             }
         } else if (connection->state == 2) {
@@ -425,17 +488,19 @@ int tls_connection_process(tls_connection *connection,
     *flags = 0;
     if (connection == NULL || (input == NULL && input_size != 0) ||
         (output == NULL && capacity != 0)) { return ENGINE_INVALID; }
+    if (connection->state == 4 && input_size != 0) { return ENGINE_INVALID; }
     if (input_size > BIO_ctrl_get_write_guarantee(connection->network)) { return ENGINE_BOUNDS; }
     if (connection->state == 3 && input_size != 0) { return ENGINE_INVALID; }
     /* Copy all input before writing output, including when buffers overlap. */
     if (input_size != 0 && BIO_write(connection->network, input, (int)input_size) != (int)input_size) {
         return ENGINE_TLS;
     }
-    if (connection->state != 3) {
+    if (connection->state != 3 && connection->state != 4) {
         connection->write_pending = 0;
         connection->error = advance(connection);
         if (connection->error != 0) {
             connection->state = 3;
+            connection->pending = (tls_host_data_request){0, 0};
             OPENSSL_cleanse(connection->headers, sizeof(connection->headers));
         }
     }
@@ -445,6 +510,7 @@ int tls_connection_process(tls_connection *connection,
         int read = BIO_read(connection->network, output, (int)count);
         if (read > 0) { *written = (size_t)read; }
     }
+    if (connection->state == 4) { *flags |= TLS_FLAG_HOST_REQUEST; }
     if (connection->handshake) { *flags |= TLS_FLAG_HANDSHAKE; }
     if (BIO_ctrl_pending(connection->network) != 0 ||
         (connection->state != 3 && connection->write_pending)) {

@@ -25,9 +25,13 @@ public:
     void open(SessionId id) override;
     ProcessResult process(SessionId id,
         const std::vector<unsigned char>& input) override;
+    ProcessResult supplyHostData(SessionId id, HostDataRequest request,
+        const std::vector<unsigned char>& data) override;
     void close(SessionId id) override;
 
 private:
+    ProcessResult invoke(SessionId id, const std::vector<unsigned char>& input,
+        std::optional<HostDataRequest> request);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

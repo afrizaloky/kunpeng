@@ -138,6 +138,22 @@ struct RestAPIHost::Impl {
                         result.opened = true;
                     }
                     auto processed = service.process(job.id, job.input);
+                    if (processed.hostRequest) {
+                        const auto request = *processed.hostRequest;
+                        if (request.operation != TLS_PROTOCOL_HOST_OP_DEMO_DATA || request.id == 0 ||
+                            !processed.handshake || processed.closed || processed.fatal ||
+                            processed.output.size() > TLS_PROTOCOL_CAPACITY)
+                            throw std::runtime_error("RestAPIHost: invalid host request");
+                        static const std::string publicData = "Public demo data from CA.\n";
+                        auto supplied = service.supplyHostData(job.id, request,
+                            std::vector<unsigned char>(publicData.begin(), publicData.end()));
+                        if (supplied.hostRequest ||
+                            supplied.output.size() > TLS_PROTOCOL_CAPACITY - processed.output.size())
+                            throw std::runtime_error("RestAPIHost: repeated request or excess output");
+                        processed.output.insert(processed.output.end(), supplied.output.begin(), supplied.output.end());
+                        supplied.output = std::move(processed.output);
+                        processed = std::move(supplied);
+                    }
                     result.handshake = processed.handshake;
                     result.more = processed.moreOutput;
                     result.closed = processed.closed;

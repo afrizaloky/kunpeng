@@ -3,10 +3,16 @@
 
 #include <cstdint>
 #include <vector>
+#include <optional>
 
 namespace kunpeng {
 
 using SessionId = std::uint64_t;
+
+struct HostDataRequest {
+    std::uint32_t operation;
+    std::uint32_t id;
+};
 
 struct ProcessResult {
     std::vector<unsigned char> output;
@@ -14,6 +20,7 @@ struct ProcessResult {
     bool moreOutput;
     bool closed;
     bool fatal;
+    std::optional<HostDataRequest> hostRequest{};
 };
 
 // Transport/protocol failures throw std::runtime_error. TLS fatal responses
@@ -30,6 +37,8 @@ public:
     virtual void open(SessionId id) = 0;
     virtual ProcessResult process(SessionId id,
         const std::vector<unsigned char>& input) = 0;
+    virtual ProcessResult supplyHostData(SessionId id, HostDataRequest request,
+        const std::vector<unsigned char>& data) = 0;
     virtual void close(SessionId id) = 0;
 };
 

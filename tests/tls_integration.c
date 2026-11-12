@@ -87,6 +87,8 @@ static void session(tls_identity *identity, const struct session_policy *policy,
     CHECK(written == 0 && flags == 0);
     unsigned char oversized[TLS_IO_CAPACITY + 1] = {0};
     CHECK(tls_connection_process(server, oversized, sizeof(oversized), NULL, 0, &written, &flags) < 0);
+    tls_host_data_request premature = {1, 1};
+    CHECK(tls_connection_supply_host_data(server, &premature, (const unsigned char *)"a", 1) < 0);
     int complete = 0;
     for (unsigned int i = 0; i < 20000; ++i) {
         int result = SSL_do_handshake(client);
@@ -95,7 +97,7 @@ static void session(tls_identity *identity, const struct session_policy *policy,
         CHECK(error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE);
         long before = BIO_ctrl_pending(outgoing) + BIO_ctrl_pending(incoming);
         CHECK(exchange(server, client, &flags) == 0);
-        CHECK(before > 0 || BIO_ctrl_pending(incoming) > 0 || (flags & TLS_FLAG_MORE_OUTPUT));
+        CHECK(before > 0 || BIO_ctrl_pending(incoming) > 0 || (flags & (TLS_FLAG_MORE_OUTPUT | TLS_FLAG_HOST_REQUEST)));
     }
     CHECK(complete);
     CHECK(SSL_version(client) == policy->version);
@@ -109,15 +111,23 @@ static void session(tls_identity *identity, const struct session_policy *policy,
     CHECK(peer != NULL);
     CHECK(X509_check_host(peer, "localhost", 0, 0, NULL) == 1);
     X509_free(peer);
+    static const char keep_get[] = "GET / HTTP/1.1\r\n\r\n";
+    static const char host_expected[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 26\r\n\r\nPublic demo data from CA.\n";
     static const char persistent[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n\r\nHello from the TEE!\n";
-    for (unsigned repeat = 0; repeat < (request->accepted == 2 ? 3u : 1u); ++repeat) {
-    for (size_t offset = 0; offset < request->size;) {
-        int result = SSL_write(client, request->bytes + offset, 1);
+    tls_host_data_request previous = {0, 0};
+    for (unsigned repeat = 0; repeat < (request->accepted >= 2 ? 3u : 1u); ++repeat) {
+    const char *wire = request->accepted == 3 && repeat == 1 ? keep_get : request->bytes;
+    size_t wire_size = strlen(wire);
+    if (request->accepted != 3) wire_size = request->size;
+    for (size_t offset = 0; offset < wire_size;) {
+        int result = SSL_write(client, wire + offset, 1);
         CHECK(result == 1);
         offset++;
     }
     char response[1024];
     size_t used = 0;
+    const char *expected_persistent = request->accepted == 3 && repeat != 1 ? host_expected : persistent;
+    size_t expected_size = strlen(expected_persistent);
     int closed = 0;
     for (unsigned int i = 0; i < 20000; ++i) {
         long before = BIO_ctrl_pending(outgoing) + BIO_ctrl_pending(incoming);
@@ -130,23 +140,58 @@ static void session(tls_identity *identity, const struct session_policy *policy,
             closed = 1;
             break;
         }
+        if (flags & TLS_FLAG_HOST_REQUEST) {
+            CHECK(request->accepted == 3 && repeat != 1 && used == 0);
+            tls_host_data_request pending, again;
+            CHECK(tls_connection_host_request(server, &pending) == 0);
+            CHECK(pending.operation == 1 && pending.id > previous.id);
+            if (previous.id != 0)
+                CHECK(tls_connection_supply_host_data(server, &previous, (const unsigned char *)"a", 1) < 0);
+            previous = pending;
+            size_t drained;
+            unsigned drain_flags;
+            CHECK(tls_connection_process(server, NULL, 0, NULL, 0, &drained, &drain_flags) == 0);
+            CHECK(drained == 0 && (drain_flags & TLS_FLAG_HOST_REQUEST));
+            CHECK(tls_connection_process(server, (const unsigned char *)"x", 1, NULL, 0, &drained, &drain_flags) < 0);
+            CHECK(tls_connection_host_request(server, &again) == 0 && again.id == pending.id);
+            tls_host_data_request wrong = {1, pending.id + 1};
+            CHECK(tls_connection_supply_host_data(server, &wrong, (const unsigned char *)"a", 1) < 0);
+            wrong = (tls_host_data_request){2, pending.id};
+            CHECK(tls_connection_supply_host_data(server, &wrong, (const unsigned char *)"a", 1) < 0);
+            unsigned char public_data[129];
+            memset(public_data, 'a', sizeof(public_data));
+            CHECK(tls_connection_supply_host_data(server, &pending, public_data, 129) < 0);
+            CHECK(tls_connection_supply_host_data(server, &pending, public_data, 0) < 0);
+            const unsigned char invalid[] = {0, '\r', '\t', 0x1f, 0x7f, 0x80};
+            for (size_t bad = 0; bad < sizeof(invalid); ++bad)
+                CHECK(tls_connection_supply_host_data(server, &pending, invalid + bad, 1) < 0);
+            tls_connection *other = NULL;
+            CHECK(tls_connection_create(&other, identity) == 0);
+            CHECK(tls_connection_supply_host_data(other, &pending, public_data, 1) < 0);
+            tls_connection_destroy(other);
+            memcpy(public_data, "Public demo data from CA.\n", 26);
+            CHECK(tls_connection_supply_host_data(server, &pending, public_data, 26) == 0);
+            memset(public_data, 'z', sizeof(public_data));
+            CHECK(tls_connection_supply_host_data(server, &pending, public_data, 26) < 0);
+            CHECK(tls_connection_process(server, NULL, 0, NULL, 0, &drained, &drain_flags) == 0);
+        }
         int result = SSL_read(client, response + used, (int)(sizeof(response) - used));
         if (result > 0) {
             used += (size_t)result;
             CHECK(used < sizeof(response));
-            if (request->accepted == 2 && used == sizeof(persistent) - 1) break;
+            if (request->accepted >= 2 && used == expected_size) break;
             continue;
         }
         int error = SSL_get_error(client, result);
         if (error == SSL_ERROR_ZERO_RETURN) { closed = 1; break; }
         CHECK(error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE);
-        CHECK(before > 0 || BIO_ctrl_pending(incoming) > 0 || (flags & TLS_FLAG_MORE_OUTPUT));
+        CHECK(before > 0 || BIO_ctrl_pending(incoming) > 0 || (flags & (TLS_FLAG_MORE_OUTPUT | TLS_FLAG_HOST_REQUEST)));
     }
-    if (request->accepted == 2) {
+    if (request->accepted >= 2) {
         CHECK(!closed);
         CHECK(!(flags & TLS_FLAG_CLOSED));
-        CHECK(used == sizeof(persistent) - 1);
-        CHECK(memcmp(response, persistent, used) == 0);
+        CHECK(used == expected_size);
+        CHECK(memcmp(response, expected_persistent, used) == 0);
     } else {
     CHECK(closed);
     if (request->accepted) {
@@ -159,7 +204,7 @@ static void session(tls_identity *identity, const struct session_policy *policy,
     }
     CHECK(flags & TLS_FLAG_HANDSHAKE);
     }
-    if (request->accepted == 2) {
+    if (request->accepted >= 2) {
         CHECK(SSL_shutdown(client) == 0);
         int closed = 0;
         for (unsigned step = 0; step < 20000; ++step) {
@@ -275,6 +320,9 @@ int main(void)
     BIO_free(source);
     const struct request_case keepalive = {"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", 35, 2};
     session(identity, &baseline, &keepalive);
+    const char *post_wire = "POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    const struct request_case post = {post_wire, strlen(post_wire), 3};
+    session(identity, &baseline, &post);
     const char *persistent_cases[] = {
         "GET / HTTP/1.1\r\nConnection: xclose, keep-alive\r\ncOnNeCtIoN: upgrade\r\n\r\n",
         "GET / HTTP/1.1\r\ncOnTeNt-LeNgTh: \t000\t\r\n\r\n"
@@ -316,6 +364,10 @@ int main(void)
     }
     const char *rejected_cases[] = {
         "HEAD / HTTP/1.1\r\n\r\n", "POST / HTTP/1.1\r\n\r\n",
+        "POST /other HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        "POST / HTTP/1.1\r\nContent-Length: 1\r\n\r\na",
+        "POST / HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        "POST / HTTP/1.1\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n",
         "GET / HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
         "GET / HTTP/1.1\r\nContent-Length: 0, 0\r\n\r\n",
         "GET / HTTP/1.1\r\nContent-Length: 1\r\n\r\n",

@@ -84,6 +84,8 @@ public:
     unsigned char reject = 0;
     bool oversized = false;
     bool failClose = false;
+    unsigned hostMode = 0, supplies = 0;
+    bool blockSupply = false;
     Bytes certificate() override { return {'P', 'E', 'M'}; }
     template<class Predicate> void await(Predicate predicate) {
         std::unique_lock<std::mutex> lock(mutex);
@@ -129,8 +131,25 @@ public:
             result.closed = !result.moreOutput && !fatal;
             result.fatal = !result.moreOutput && fatal;
         }
+        if (hostMode && !input.empty() && input.front() == 0x44)
+            result.hostRequest = kunpeng::HostDataRequest{hostMode == 2 ? 2u : 1u, 7};
         session.active = false;
         changed.notify_all();
+        return result;
+    }
+    kunpeng::ProcessResult supplyHostData(SessionId id, kunpeng::HostDataRequest request,
+        const Bytes& data) override {
+        std::unique_lock<std::mutex> lock(mutex);
+        auto& session = sessions.at(id);
+        CHECK(!session.active && session.closes == 0);
+        CHECK(request.operation == 1 && request.id == 7);
+        const std::string expected = "Public demo data from CA.\n";
+        CHECK(data == Bytes(expected.begin(), expected.end()));
+        ++supplies;
+        if (blockSupply) gate(lock);
+        if (hostMode == 4) throw std::runtime_error("uncertain supply failure");
+        kunpeng::ProcessResult result{{0xb8}, true, false, false, false};
+        if (hostMode == 3) result.hostRequest = request;
         return result;
     }
     void close(SessionId id) override {
@@ -386,8 +405,44 @@ void accept_flood_does_not_starve_stop() {
     flood.get();
     backend.cleaned(1);
 }
+void host_supply_is_bounded_and_failure_cleans_once() {
+    for (unsigned mode = 1; mode <= 4; ++mode) {
+        Backend backend;
+        backend.blockCount = 0;
+        backend.hostMode = mode;
+        RunningHost running(backend, options());
+        Client client(running.host.boundPort());
+        client.send(0x44);
+        if (mode == 1) CHECK(client.receive(2) == Bytes({0xa7, 0xb8}));
+        else client.eof();
+        running.host.stop();
+        running.join();
+        backend.cleaned(1);
+        CHECK(backend.supplies == (mode == 2 ? 0u : 1u));
+    }
+}
+void supply_wait_does_not_block_other_clients() {
+    Backend backend;
+    backend.blockCount = 0;
+    backend.hostMode = 1;
+    backend.blockSupply = true;
+    RunningHost running(backend, options());
+    Client first(running.host.boundPort());
+    first.send(0x44);
+    backend.await([&] { return backend.blocked == 1; });
+    Client second(running.host.boundPort());
+    second.send(0x55);
+    CHECK(second.receive(1) == Bytes{0xa7});
+    backend.release();
+    CHECK(first.receive(2) == Bytes({0xa7, 0xb8}));
+    running.host.stop();
+    running.join();
+    backend.cleaned(2);
+}
 } // namespace
 int main() {
+    host_supply_is_bounded_and_failure_cleans_once();
+    supply_wait_does_not_block_other_clients();
     concurrent_clients_keep_session_operations_serial();
     bounded_queue_recovers_without_losing_input();
     terminal_output_drains(false);

@@ -151,6 +151,21 @@ void ITrusteeTlsSessionService::open(SessionId id)
 ProcessResult ITrusteeTlsSessionService::process(SessionId id,
     const std::vector<unsigned char>& input)
 {
+    return invoke(id, input, std::nullopt);
+}
+
+ProcessResult ITrusteeTlsSessionService::supplyHostData(SessionId id,
+    HostDataRequest request, const std::vector<unsigned char>& data)
+{
+    if (request.operation != TLS_PROTOCOL_HOST_OP_DEMO_DATA || request.id == 0 ||
+        data.empty() || data.size() > TLS_PROTOCOL_HOST_DATA_CAPACITY)
+        throw std::runtime_error("invalid host data supply");
+    return invoke(id, data, request);
+}
+
+ProcessResult ITrusteeTlsSessionService::invoke(SessionId id,
+    const std::vector<unsigned char>& input, std::optional<HostDataRequest> request)
+{
     auto session = impl_->find(id);
     std::lock_guard<std::mutex> lock(session->mutex);
     if (session->closed)
@@ -164,7 +179,12 @@ ProcessResult ITrusteeTlsSessionService::process(SessionId id,
     TEEC_Operation operation{};
     operation.started = 1;
     operation.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
-        TEEC_MEMREF_TEMP_OUTPUT, TEEC_VALUE_OUTPUT, TEEC_NONE);
+        TEEC_MEMREF_TEMP_OUTPUT, TEEC_VALUE_OUTPUT,
+        request ? TEEC_VALUE_INOUT : TEEC_VALUE_OUTPUT);
+    if (request) {
+        operation.params[3].value.a = request->operation;
+        operation.params[3].value.b = request->id;
+    }
     operation.params[0].tmpref.buffer = input.empty() ? &emptyInput
         : const_cast<unsigned char*>(input.data());
     operation.params[0].tmpref.size = static_cast<std::uint32_t>(input.size());
@@ -174,7 +194,8 @@ ProcessResult ITrusteeTlsSessionService::process(SessionId id,
     TEEC_Result result;
     {
         std::lock_guard<std::mutex> sdkLock(impl_->contextMutex);
-        result = TEEC_InvokeCommand(&session->handle, TLS_CMD_PROCESS,
+        result = TEEC_InvokeCommand(&session->handle,
+            request ? TLS_CMD_SUPPLY_HOST_DATA : TLS_CMD_PROCESS,
             &operation, &origin);
     }
     if (result != TEEC_SUCCESS)
@@ -184,10 +205,21 @@ ProcessResult ITrusteeTlsSessionService::process(SessionId id,
     const auto length = operation.params[1].tmpref.size;
     constexpr std::uint32_t validFlags = TLS_PROTOCOL_FLAG_HANDSHAKE
         | TLS_PROTOCOL_FLAG_MORE_OUTPUT | TLS_PROTOCOL_FLAG_CLOSED
-        | TLS_PROTOCOL_FLAG_FATAL;
+        | TLS_PROTOCOL_FLAG_FATAL | TLS_PROTOCOL_FLAG_HOST_REQUEST;
     if (length > response.output.size() || operation.params[2].value.b != 0
         || (flags & ~validFlags) != 0)
         throw std::runtime_error("invalid process response");
+    const auto op = operation.params[3].value.a;
+    const auto requestId = operation.params[3].value.b;
+    if (flags & TLS_PROTOCOL_FLAG_HOST_REQUEST) {
+        if (op != TLS_PROTOCOL_HOST_OP_DEMO_DATA || requestId == 0 ||
+            !(flags & TLS_PROTOCOL_FLAG_HANDSHAKE) ||
+            (flags & (TLS_PROTOCOL_FLAG_CLOSED | TLS_PROTOCOL_FLAG_FATAL)))
+            throw std::runtime_error("invalid host request response");
+        response.hostRequest = HostDataRequest{op, requestId};
+    } else if (op != 0 || requestId != 0) {
+        throw std::runtime_error("unexpected host request metadata");
+    }
     response.output.resize(length);
     response.handshake = (flags & TLS_PROTOCOL_FLAG_HANDSHAKE) != 0;
     response.moreOutput = (flags & TLS_PROTOCOL_FLAG_MORE_OUTPUT) != 0;

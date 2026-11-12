@@ -105,6 +105,21 @@ int tls_connection_process(tls_connection *connection, const unsigned char *inpu
     engine_enter(); CHECK(connection->owner != NULL && capacity >= 1);
     out[0] = 17; *written = 1; *flags = TLS_FLAG_HANDSHAKE; engine_leave(); return 0;
 }
+int tls_connection_host_request(const tls_connection *connection, tls_host_data_request *request)
+{
+    CHECK(connection->owner != NULL);
+    *request = (tls_host_data_request){0, 0};
+    return 0;
+}
+int tls_connection_supply_host_data(tls_connection *connection,
+    const tls_host_data_request *request, const unsigned char *data, size_t size)
+{
+    engine_enter();
+    CHECK(connection->owner != NULL && request->operation == 1 && request->id == 7);
+    CHECK(size == 1 && data[0] == 'a');
+    engine_leave();
+    return 0;
+}
 struct job { unsigned operation; void *context; };
 static void *run_job(void *argument)
 {
@@ -114,9 +129,19 @@ static void *run_job(void *argument)
     if (job->operation == 0) {
         params[1].memref.buffer = output; params[1].memref.size = sizeof(output);
         CHECK(TA_InvokeCommandEntryPoint(job->context, TLS_CMD_PROCESS,
-            TEE_PARAM_TYPES(5, 6, 2, 0), params) == TEE_SUCCESS);
+            TEE_PARAM_TYPES(5, 6, 2, 2), params) == TEE_SUCCESS);
         CHECK(output[0] == 17 && params[1].memref.size == 1);
         CHECK(params[2].value.a == TLS_FLAG_HANDSHAKE);
+        CHECK(params[3].value.a == 0 && params[3].value.b == 0);
+        params[0].memref.buffer = (void *)"a";
+        params[0].memref.size = 1;
+        params[1].memref.size = sizeof(output);
+        params[3].value.a = 1; params[3].value.b = 7;
+        CHECK(TA_InvokeCommandEntryPoint(job->context, TLS_CMD_SUPPLY_HOST_DATA,
+            TEE_PARAM_TYPES(5, 6, 2, 3), params) == TEE_SUCCESS);
+        CHECK(output[0] == 17 && params[1].memref.size == 1);
+        CHECK(params[2].value.a == TLS_FLAG_HANDSHAKE && params[2].value.b == 0);
+        CHECK(params[3].value.a == 0 && params[3].value.b == 0);
     } else if (job->operation == 1) {
         params[0].memref.buffer = output; params[0].memref.size = sizeof(output);
         CHECK(TA_InvokeCommandEntryPoint(job->context, TLS_CMD_CERTIFICATE,

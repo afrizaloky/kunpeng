@@ -105,9 +105,10 @@ TEE_Result TA_InvokeCommandEntryPoint(void *context, uint32_t command,
         return TEE_ERROR_BAD_PARAMETERS;
     switch (command) {
     case TLS_CMD_PROCESS:
+    case TLS_CMD_SUPPLY_HOST_DATA:
         if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
             TEE_PARAM_TYPE_MEMREF_OUTPUT, TEE_PARAM_TYPE_VALUE_OUTPUT,
-            TEE_PARAM_TYPE_NONE))
+            command == TLS_CMD_PROCESS ? TEE_PARAM_TYPE_VALUE_OUTPUT : TEE_PARAM_TYPE_VALUE_INOUT))
             return TEE_ERROR_BAD_PARAMETERS;
         if (params[0].memref.size > TLS_PROTOCOL_CAPACITY ||
             (params[0].memref.size != 0 && params[0].memref.buffer == NULL) ||
@@ -117,9 +118,26 @@ TEE_Result TA_InvokeCommandEntryPoint(void *context, uint32_t command,
             return TEE_ERROR_BAD_PARAMETERS;
         if (pthread_mutex_lock(&engine_mutex) != 0)
             return TEE_ERROR_GENERIC;
-        result = tls_connection_process(context, params[0].memref.buffer,
-            params[0].memref.size, params[1].memref.buffer,
-            params[1].memref.size, &written, &flags);
+        tls_host_data_request before = {0, 0};
+        tls_connection_host_request(context, &before);
+        if (command == TLS_CMD_PROCESS && before.id != 0 && params[0].memref.size != 0) {
+            unlock_engine();
+            return TEE_ERROR_BAD_PARAMETERS;
+        }
+        if (command == TLS_CMD_SUPPLY_HOST_DATA) {
+            tls_host_data_request supplied = {params[3].value.a, params[3].value.b};
+            result = tls_connection_supply_host_data(context, &supplied,
+                params[0].memref.buffer, params[0].memref.size);
+            if (result != 0) { unlock_engine(); return TEE_ERROR_BAD_PARAMETERS; }
+        }
+        result = tls_connection_process(context,
+            command == TLS_CMD_PROCESS ? params[0].memref.buffer : NULL,
+            command == TLS_CMD_PROCESS ? params[0].memref.size : 0,
+            params[1].memref.buffer, params[1].memref.size, &written, &flags);
+        tls_host_data_request pending = {0, 0};
+        tls_connection_host_request(context, &pending);
+        params[3].value.a = pending.operation;
+        params[3].value.b = pending.id;
         unlock_engine();
         params[1].memref.size = written;
         params[2].value.a = flags | (result != 0 ?

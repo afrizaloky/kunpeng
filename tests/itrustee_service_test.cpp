@@ -34,6 +34,7 @@ struct Boundary {
     bool failInvoke = false;
     std::uint32_t flags = 15;
     std::uint32_t reserved = 0;
+    std::uint32_t op = 0, requestId = 0;
     std::uint32_t length = 3;
     std::vector<unsigned char> cert{'P', 'E', 'M', 0};
     std::mutex mutex;
@@ -66,6 +67,28 @@ void contracts()
     require(result.handshake && result.moreOutput && result.closed && result.fatal);
     boundary.flags = 16;
     rejects([&] { service.process(1, {}); });
+    boundary.flags = TLS_PROTOCOL_FLAG_HANDSHAKE | TLS_PROTOCOL_FLAG_HOST_REQUEST;
+    boundary.op = 1; boundary.requestId = 7;
+    result = service.process(1, {});
+    require(result.hostRequest && result.hostRequest->operation == 1 && result.hostRequest->id == 7);
+    boundary.requestId = 0;
+    rejects([&] { service.process(1, {}); });
+    boundary.requestId = 7; boundary.op = 2;
+    rejects([&] { service.process(1, {}); });
+    boundary.op = 1; boundary.flags |= TLS_PROTOCOL_FLAG_CLOSED;
+    rejects([&] { service.process(1, {}); });
+    boundary.flags = TLS_PROTOCOL_FLAG_HANDSHAKE;
+    rejects([&] { service.process(1, {}); });
+    boundary.op = 0; boundary.requestId = 0;
+    result = service.supplyHostData(1, {1, 7}, {'a', '\n'});
+    require(!result.hostRequest && result.handshake && result.output.size() == 3);
+    rejects([&] { service.supplyHostData(1, {1, 0}, {'a'}); });
+    rejects([&] { service.supplyHostData(1, {2, 7}, {'a'}); });
+    rejects([&] { service.supplyHostData(1, {1, 7}, {}); });
+    rejects([&] { service.supplyHostData(1, {1, 7}, std::vector<unsigned char>(129)); });
+    boundary.failInvoke = true;
+    rejects([&] { service.supplyHostData(1, {1, 7}, {'a', '\n'}); });
+    boundary.failInvoke = false;
     boundary.flags = 0;
     boundary.reserved = 1;
     rejects([&] { service.process(1, {}); });
@@ -179,9 +202,16 @@ TEEC_Result TEEC_InvokeCommand(TEEC_Session* session, uint32_t command,
             boundary.cert.data(), boundary.cert.size());
         operation->params[0].tmpref.size = boundary.cert.size();
     } else {
-        require(command == TLS_CMD_PROCESS);
+        require(command == TLS_CMD_PROCESS || command == TLS_CMD_SUPPLY_HOST_DATA);
         require(operation->paramTypes == TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
-            TEEC_MEMREF_TEMP_OUTPUT, TEEC_VALUE_OUTPUT, TEEC_NONE));
+            TEEC_MEMREF_TEMP_OUTPUT, TEEC_VALUE_OUTPUT,
+            command == TLS_CMD_PROCESS ? static_cast<std::uint32_t>(TEEC_VALUE_OUTPUT)
+                                       : static_cast<std::uint32_t>(TEEC_VALUE_INOUT)));
+        if (command == TLS_CMD_SUPPLY_HOST_DATA) {
+            require(operation->params[3].value.a == 1 && operation->params[3].value.b == 7);
+            require(operation->params[0].tmpref.size == 2);
+            require(std::memcmp(operation->params[0].tmpref.buffer, "a\n", 2) == 0);
+        }
         std::unique_lock<std::mutex> lock(boundary.mutex);
         if (boundary.block) {
             boundary.entered = true;
@@ -194,6 +224,8 @@ TEEC_Result TEEC_InvokeCommand(TEEC_Session* session, uint32_t command,
         operation->params[1].tmpref.size = boundary.length;
         operation->params[2].value.a = boundary.flags;
         operation->params[2].value.b = boundary.reserved;
+        operation->params[3].value.a = boundary.op;
+        operation->params[3].value.b = boundary.requestId;
     }
     return TEEC_SUCCESS;
 }

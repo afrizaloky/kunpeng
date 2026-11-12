@@ -73,8 +73,20 @@ public:
         result.moreOutput = (flags & TLS_FLAG_MORE_OUTPUT) != 0;
         result.closed = (flags & TLS_FLAG_CLOSED) != 0;
         result.fatal = status < 0;
+        tls_host_data_request pending{};
+        CHECK(tls_connection_host_request(sessions.at(id), &pending) == 0);
+        if (pending.id) result.hostRequest = kunpeng::HostDataRequest{pending.operation, pending.id};
         if (!input.empty()) { ++inputCalls; changed.notify_all(); }
         return result;
+    }
+    kunpeng::ProcessResult supplyHostData(SessionId id, kunpeng::HostDataRequest request,
+        const Bytes& data) override {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            tls_host_data_request supplied{request.operation, request.id};
+            CHECK(tls_connection_supply_host_data(sessions.at(id), &supplied, data.data(), data.size()) == 0);
+        }
+        return process(id, {});
     }
     void close(SessionId id) override {
         std::lock_guard<std::mutex> lock(mutex);
@@ -184,10 +196,13 @@ struct Client {
         for (unsigned repeat = 0; repeat < 3; ++repeat) {
         const std::string request = repeat == 2
             ? "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-            : "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            : (repeat == 0 ? "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+                           : "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
         CHECK(SSL_write(ssl.get(), request.data(), static_cast<int>(request.size())) == static_cast<int>(request.size()));
-        const std::string expected = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n"
-            + std::string(repeat == 2 ? "Connection: close\r\n" : "") + "\r\nHello from the TEE!\n";
+        const std::string expected = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: "
+            + std::string(repeat == 0 ? "26" : "20") + "\r\n"
+            + std::string(repeat == 2 ? "Connection: close\r\n" : "")
+            + (repeat == 0 ? "\r\nPublic demo data from CA.\n" : "\r\nHello from the TEE!\n");
         std::string response;
         for (;;) {
             CHECK(std::chrono::steady_clock::now() < deadline);
@@ -203,6 +218,7 @@ struct Client {
             CHECK(error == SSL_ERROR_WANT_READ);
             exchange();
         }
+        if (response != expected) std::fprintf(stderr, "actual=[%s] expected=[%s]\n", response.c_str(), expected.c_str());
         CHECK(response == expected);
         }
     }

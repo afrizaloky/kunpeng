@@ -14,6 +14,7 @@ typedef union {
 #define TEE_ERROR_BUSY 0xffff000du
 #define TEE_PARAM_TYPE_NONE 0u
 #define TEE_PARAM_TYPE_VALUE_OUTPUT 2u
+#define TEE_PARAM_TYPE_VALUE_INOUT 3u
 #define TEE_PARAM_TYPE_MEMREF_INPUT 5u
 #define TEE_PARAM_TYPE_MEMREF_OUTPUT 6u
 #define TEE_PARAM_TYPES(a,b,c,d) ((a) | ((b)<<4) | ((c)<<8) | ((d)<<12))
