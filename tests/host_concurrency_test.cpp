@@ -131,8 +131,10 @@ public:
             result.closed = !result.moreOutput && !fatal;
             result.fatal = !result.moreOutput && fatal;
         }
-        if (hostMode && !input.empty() && input.front() == 0x44)
+        if (hostMode && !input.empty() && input.front() == 0x44) {
+            result.output.clear();
             result.hostRequest = kunpeng::HostDataRequest{hostMode == 2 ? 2u : 1u, 7};
+        }
         session.active = false;
         changed.notify_all();
         return result;
@@ -144,7 +146,10 @@ public:
         CHECK(!session.active && session.closes == 0);
         CHECK(request.operation == 1 && request.id == 7);
         const std::string expected = "Public demo data from CA.\n";
-        CHECK(data == Bytes(expected.begin(), expected.end()));
+        host_call_chunk chunk{};
+        CHECK(host_call_decode(data.data(), data.size(), &chunk) == 0);
+        CHECK(chunk.operation == request.operation && chunk.id == request.id && chunk.final);
+        CHECK(Bytes(data.begin() + HOST_CALL_HEADER_SIZE, data.end()) == Bytes(expected.begin(), expected.end()));
         ++supplies;
         if (blockSupply) gate(lock);
         if (hostMode == 4) throw std::runtime_error("uncertain supply failure");
@@ -168,12 +173,21 @@ public:
 };
 
 struct RunningHost {
+    kunpeng::HostCallDispatcher dispatcher;
+    kunpeng::RestAPIHost::Options configure(kunpeng::RestAPIHost::Options options) {
+        dispatcher.registerHandler(1, [](const kunpeng::HostCallRequest&) {
+            const std::string data = "Public demo data from CA.\n";
+            return kunpeng::HostCallReply{kunpeng::HostCallStatus::Success, {data.begin(), data.end()}};
+        });
+        options.hostDispatcher = &dispatcher;
+        return options;
+    }
     kunpeng::RestAPIHost host;
     std::promise<void> done;
     std::future<void> completion = done.get_future();
     std::thread thread;
     RunningHost(Backend& backend, kunpeng::RestAPIHost::Options options)
-        : host(backend, options), thread([this] {
+        : host(backend, configure(options)), thread([this] {
             try { host.run(); done.set_value(); }
             catch (...) { done.set_exception(std::current_exception()); }
         }) { CHECK(host.waitUntilRunning(bound)); CHECK(host.boundPort() != 0); }
@@ -413,7 +427,7 @@ void host_supply_is_bounded_and_failure_cleans_once() {
         RunningHost running(backend, options());
         Client client(running.host.boundPort());
         client.send(0x44);
-        if (mode == 1) CHECK(client.receive(2) == Bytes({0xa7, 0xb8}));
+        if (mode == 1) CHECK(client.receive(1) == Bytes({0xb8}));
         else client.eof();
         running.host.stop();
         running.join();
@@ -434,7 +448,7 @@ void supply_wait_does_not_block_other_clients() {
     second.send(0x55);
     CHECK(second.receive(1) == Bytes{0xa7});
     backend.release();
-    CHECK(first.receive(2) == Bytes({0xa7, 0xb8}));
+    CHECK(first.receive(1) == Bytes({0xb8}));
     running.host.stop();
     running.join();
     backend.cleaned(2);

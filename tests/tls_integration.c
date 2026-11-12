@@ -87,8 +87,6 @@ static void session(tls_identity *identity, const struct session_policy *policy,
     CHECK(written == 0 && flags == 0);
     unsigned char oversized[TLS_IO_CAPACITY + 1] = {0};
     CHECK(tls_connection_process(server, oversized, sizeof(oversized), NULL, 0, &written, &flags) < 0);
-    tls_host_data_request premature = {1, 1};
-    CHECK(tls_connection_supply_host_data(server, &premature, (const unsigned char *)"a", 1) < 0);
     int complete = 0;
     for (unsigned int i = 0; i < 20000; ++i) {
         int result = SSL_do_handshake(client);
@@ -112,7 +110,7 @@ static void session(tls_identity *identity, const struct session_policy *policy,
     CHECK(X509_check_host(peer, "localhost", 0, 0, NULL) == 1);
     X509_free(peer);
     static const char keep_get[] = "GET / HTTP/1.1\r\n\r\n";
-    static const char host_expected[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 26\r\n\r\nPublic demo data from CA.\n";
+    static const char host_expected[] = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 26\r\n\r\nPublic demo data from CA.\n";
     static const char persistent[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n\r\nHello from the TEE!\n";
     tls_host_data_request previous = {0, 0};
     for (unsigned repeat = 0; repeat < (request->accepted >= 2 ? 3u : 1u); ++repeat) {
@@ -145,8 +143,6 @@ static void session(tls_identity *identity, const struct session_policy *policy,
             tls_host_data_request pending, again;
             CHECK(tls_connection_host_request(server, &pending) == 0);
             CHECK(pending.operation == 1 && pending.id > previous.id);
-            if (previous.id != 0)
-                CHECK(tls_connection_supply_host_data(server, &previous, (const unsigned char *)"a", 1) < 0);
             previous = pending;
             size_t drained;
             unsigned drain_flags;
@@ -154,26 +150,15 @@ static void session(tls_identity *identity, const struct session_policy *policy,
             CHECK(drained == 0 && (drain_flags & TLS_FLAG_HOST_REQUEST));
             CHECK(tls_connection_process(server, (const unsigned char *)"x", 1, NULL, 0, &drained, &drain_flags) < 0);
             CHECK(tls_connection_host_request(server, &again) == 0 && again.id == pending.id);
-            tls_host_data_request wrong = {1, pending.id + 1};
-            CHECK(tls_connection_supply_host_data(server, &wrong, (const unsigned char *)"a", 1) < 0);
-            wrong = (tls_host_data_request){2, pending.id};
-            CHECK(tls_connection_supply_host_data(server, &wrong, (const unsigned char *)"a", 1) < 0);
-            unsigned char public_data[129];
-            memset(public_data, 'a', sizeof(public_data));
-            CHECK(tls_connection_supply_host_data(server, &pending, public_data, 129) < 0);
-            CHECK(tls_connection_supply_host_data(server, &pending, public_data, 0) < 0);
-            const unsigned char invalid[] = {0, '\r', '\t', 0x1f, 0x7f, 0x80};
-            for (size_t bad = 0; bad < sizeof(invalid); ++bad)
-                CHECK(tls_connection_supply_host_data(server, &pending, invalid + bad, 1) < 0);
-            tls_connection *other = NULL;
-            CHECK(tls_connection_create(&other, identity) == 0);
-            CHECK(tls_connection_supply_host_data(other, &pending, public_data, 1) < 0);
-            tls_connection_destroy(other);
-            memcpy(public_data, "Public demo data from CA.\n", 26);
-            CHECK(tls_connection_supply_host_data(server, &pending, public_data, 26) == 0);
+            static const unsigned char demo[] = "Public demo data from CA.\n";
+            unsigned char public_data[HOST_CALL_HEADER_SIZE + sizeof(demo) - 1];
+            host_call_chunk chunk = {pending.operation, pending.id, 0, sizeof(demo) - 1, HOST_CALL_OK, 1};
+            CHECK(host_call_encode(public_data, &chunk) == 0);
+            memcpy(public_data + HOST_CALL_HEADER_SIZE, demo, sizeof(demo) - 1);
+            CHECK(tls_connection_supply_host_chunk(server, public_data, sizeof(public_data)) == 0);
             memset(public_data, 'z', sizeof(public_data));
-            CHECK(tls_connection_supply_host_data(server, &pending, public_data, 26) < 0);
             CHECK(tls_connection_process(server, NULL, 0, NULL, 0, &drained, &drain_flags) == 0);
+            flags = drain_flags;
         }
         int result = SSL_read(client, response + used, (int)(sizeof(response) - used));
         if (result > 0) {

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include "TlsSessionService.h"
 
 namespace kunpeng {
 class TlsSessionService;
@@ -24,6 +25,7 @@ public:
         std::size_t maxOutboundBytes{262144};
         std::chrono::milliseconds handshakeTimeout{15000};
         std::chrono::milliseconds idleTimeout{15000};
+        HostCallDispatcher* hostDispatcher{nullptr};
     };
 
     RestAPIHost(TlsSessionService& service, Options options);

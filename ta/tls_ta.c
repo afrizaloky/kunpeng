@@ -105,10 +105,10 @@ TEE_Result TA_InvokeCommandEntryPoint(void *context, uint32_t command,
         return TEE_ERROR_BAD_PARAMETERS;
     switch (command) {
     case TLS_CMD_PROCESS:
-    case TLS_CMD_SUPPLY_HOST_DATA:
+    case TLS_CMD_SUPPLY_HOST_CHUNK:
         if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
             TEE_PARAM_TYPE_MEMREF_OUTPUT, TEE_PARAM_TYPE_VALUE_OUTPUT,
-            command == TLS_CMD_PROCESS ? TEE_PARAM_TYPE_VALUE_OUTPUT : TEE_PARAM_TYPE_VALUE_INOUT))
+            TEE_PARAM_TYPE_VALUE_OUTPUT))
             return TEE_ERROR_BAD_PARAMETERS;
         if (params[0].memref.size > TLS_PROTOCOL_CAPACITY ||
             (params[0].memref.size != 0 && params[0].memref.buffer == NULL) ||
@@ -124,11 +124,17 @@ TEE_Result TA_InvokeCommandEntryPoint(void *context, uint32_t command,
             unlock_engine();
             return TEE_ERROR_BAD_PARAMETERS;
         }
-        if (command == TLS_CMD_SUPPLY_HOST_DATA) {
-            tls_host_data_request supplied = {params[3].value.a, params[3].value.b};
-            result = tls_connection_supply_host_data(context, &supplied,
+        if (command == TLS_CMD_SUPPLY_HOST_CHUNK) {
+            result = tls_connection_supply_host_chunk(context,
                 params[0].memref.buffer, params[0].memref.size);
-            if (result != 0) { unlock_engine(); return TEE_ERROR_BAD_PARAMETERS; }
+            if (result != 0) {
+                params[1].memref.size = 0;
+                params[2].value.a = TLS_PROTOCOL_FLAG_FATAL | TLS_PROTOCOL_FLAG_CLOSED;
+                params[2].value.b = 0;
+                params[3].value.a = 0; params[3].value.b = 0;
+                unlock_engine();
+                return TEE_SUCCESS;
+            }
         }
         result = tls_connection_process(context,
             command == TLS_CMD_PROCESS ? params[0].memref.buffer : NULL,

@@ -53,6 +53,7 @@ struct tls_identity {
     unsigned char pem[2048];
     size_t pem_size;
     uint32_t next_request_id;
+    host_call_budget host_budget;
 };
 
 struct tls_connection {
@@ -60,8 +61,11 @@ struct tls_connection {
     BIO *network;
     tls_identity *identity;
     tls_host_data_request pending;
-    unsigned char host_response[256];
+    host_call host_object;
+    unsigned char host_response[160];
     size_t host_response_size;
+    size_t body_offset;
+    int host_body;
     unsigned char headers[4096];
     size_t header_size;
     size_t response_offset;
@@ -272,6 +276,7 @@ int tls_identity_certificate(tls_identity *identity, unsigned char *out,
 void tls_connection_destroy(tls_connection *connection)
 {
     if (connection == NULL) { return; }
+    host_call_release(&connection->host_object);
     SSL_free(connection->ssl);
     BIO_free(connection->network);
     OPENSSL_cleanse(connection, sizeof(*connection));
@@ -396,34 +401,38 @@ int tls_connection_host_request(const tls_connection *connection, tls_host_data_
     return 0;
 }
 
-int tls_connection_supply_host_data(tls_connection *connection,
-    const tls_host_data_request *request, const unsigned char *data, size_t size)
+int tls_connection_supply_host_chunk(tls_connection *connection,
+    const unsigned char *wire, size_t size)
 {
-    if (connection == NULL || request == NULL || data == NULL || size == 0 ||
-        size > TLS_HOST_DATA_CAPACITY || connection->state != 4 ||
-        request->operation != TLS_HOST_OP_DEMO_DATA || request->id == 0 ||
-        request->id != connection->pending.id ||
-        request->operation != connection->pending.operation) { return ENGINE_INVALID; }
-    unsigned char public_data[TLS_HOST_DATA_CAPACITY];
-    memcpy(public_data, data, size);
-    for (size_t i = 0; i < size; ++i) {
-        if (public_data[i] != '\n' && (public_data[i] < 0x20 || public_data[i] > 0x7e)) {
-            return ENGINE_INVALID;
-        }
+    if (connection == NULL) return ENGINE_INVALID;
+    if (connection->state != 4 ||
+        host_call_receive(&connection->host_object, wire, size) != 0) {
+        host_call_release(&connection->host_object);
+        connection->pending = (tls_host_data_request){0, 0};
+        connection->state = 3;
+        connection->error = ENGINE_INVALID;
+        return ENGINE_INVALID;
     }
-    static const char prefix[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ";
+    if (connection->host_object.state != HOST_CALL_COMPLETE) return 0;
+    /* Operation-specific decoder: DEMO_DATA permits every binary string,
+     * including empty; it has no authentication or authorization meaning. */
+    static const char prefix[] = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: ";
     unsigned char *out = connection->host_response;
     size_t used = sizeof(prefix) - 1;
     memcpy(out, prefix, used);
-    if (size >= 100) { out[used++] = (unsigned char)('0' + size / 100); }
-    if (size >= 10) { out[used++] = (unsigned char)('0' + (size / 10) % 10); }
-    out[used++] = (unsigned char)('0' + size % 10);
+    size_t length = connection->host_object.size;
+    size_t divisor = 1;
+    while (length / divisor >= 10) divisor *= 10;
+    do {
+        out[used++] = (unsigned char)('0' + length / divisor);
+        length %= divisor;
+        divisor /= 10;
+    } while (divisor);
     const char *ending = connection->close_after_response ? "\r\nConnection: close\r\n\r\n" : "\r\n\r\n";
     size_t ending_size = strlen(ending);
     memcpy(out + used, ending, ending_size);
-    used += ending_size;
-    memcpy(out + used, public_data, size);
-    connection->host_response_size = used + size;
+    connection->host_response_size = used + ending_size;
+    connection->host_body = 1;
     connection->pending = (tls_host_data_request){0, 0};
     connection->state = 1;
     return 0;
@@ -466,6 +475,8 @@ static int advance(tls_connection *connection)
                     if (connection->identity->next_request_id == UINT32_MAX) { return ENGINE_HTTP; }
                     connection->pending.operation = TLS_HOST_OP_DEMO_DATA;
                     connection->pending.id = ++connection->identity->next_request_id;
+                    if (host_call_begin(&connection->host_object, &connection->identity->host_budget,
+                        connection->pending.operation, connection->pending.id) != 0) return ENGINE_HTTP;
                     connection->state = 4;
                     return 0;
                 }
@@ -478,15 +489,29 @@ static int advance(tls_connection *connection)
                 bytes = connection->host_response;
                 size = connection->host_response_size;
             }
-            ret = SSL_write(connection->ssl, bytes + connection->response_offset,
-                             (int)(size - connection->response_offset));
-            if (ret <= 0) { return ssl_result(connection, ret); }
-            connection->response_offset += (size_t)ret;
+            if (connection->response_offset < size) {
+                ret = SSL_write(connection->ssl, bytes + connection->response_offset,
+                                 (int)(size - connection->response_offset));
+                if (ret <= 0) { return ssl_result(connection, ret); }
+                connection->response_offset += (size_t)ret;
+            }
+            if (connection->host_body && connection->response_offset == size &&
+                connection->body_offset < connection->host_object.size) {
+                size_t available;
+                bytes = host_call_slice(&connection->host_object, connection->body_offset, &available);
+                ret = SSL_write(connection->ssl, bytes, (int)available);
+                if (ret <= 0) { return ssl_result(connection, ret); }
+                connection->body_offset += (size_t)ret;
+                continue;
+            }
             if (connection->response_offset == size) {
                 connection->state = connection->close_after_response ? 2 : 0;
                 connection->header_size = 0;
                 connection->response_offset = 0;
                 connection->host_response_size = 0;
+                connection->body_offset = 0;
+                connection->host_body = 0;
+                host_call_release(&connection->host_object);
                 OPENSSL_cleanse(connection->host_response, sizeof(connection->host_response));
                 connection->close_after_response = 0;
             }
@@ -523,6 +548,7 @@ int tls_connection_process(tls_connection *connection,
         if (connection->error != 0) {
             connection->state = 3;
             connection->pending = (tls_host_data_request){0, 0};
+            host_call_release(&connection->host_object);
             OPENSSL_cleanse(connection->headers, sizeof(connection->headers));
         }
     }

@@ -111,11 +111,11 @@ int tls_connection_host_request(const tls_connection *connection, tls_host_data_
     *request = (tls_host_data_request){0, 0};
     return 0;
 }
-int tls_connection_supply_host_data(tls_connection *connection,
-    const tls_host_data_request *request, const unsigned char *data, size_t size)
+int tls_connection_supply_host_chunk(tls_connection *connection,
+    const unsigned char *data, size_t size)
 {
     engine_enter();
-    CHECK(connection->owner != NULL && request->operation == 1 && request->id == 7);
+    CHECK(connection->owner != NULL);
     CHECK(size == 1 && data[0] == 'a');
     engine_leave();
     return 0;
@@ -137,8 +137,8 @@ static void *run_job(void *argument)
         params[0].memref.size = 1;
         params[1].memref.size = sizeof(output);
         params[3].value.a = 1; params[3].value.b = 7;
-        CHECK(TA_InvokeCommandEntryPoint(job->context, TLS_CMD_SUPPLY_HOST_DATA,
-            TEE_PARAM_TYPES(5, 6, 2, 3), params) == TEE_SUCCESS);
+        CHECK(TA_InvokeCommandEntryPoint(job->context, TLS_CMD_SUPPLY_HOST_CHUNK,
+            TEE_PARAM_TYPES(5, 6, 2, 2), params) == TEE_SUCCESS);
         CHECK(output[0] == 17 && params[1].memref.size == 1);
         CHECK(params[2].value.a == TLS_FLAG_HANDSHAKE && params[2].value.b == 0);
         CHECK(params[3].value.a == 0 && params[3].value.b == 0);

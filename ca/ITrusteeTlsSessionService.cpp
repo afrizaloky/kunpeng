@@ -157,8 +157,10 @@ ProcessResult ITrusteeTlsSessionService::process(SessionId id,
 ProcessResult ITrusteeTlsSessionService::supplyHostData(SessionId id,
     HostDataRequest request, const std::vector<unsigned char>& data)
 {
-    if (request.operation != TLS_PROTOCOL_HOST_OP_DEMO_DATA || request.id == 0 ||
-        data.empty() || data.size() > TLS_PROTOCOL_HOST_DATA_CAPACITY)
+    host_call_chunk chunk{};
+    if (host_call_decode(data.data(), data.size(), &chunk) != 0 ||
+        request.operation != TLS_PROTOCOL_HOST_OP_DEMO_DATA || request.id == 0 ||
+        chunk.operation != request.operation || chunk.id != request.id)
         throw std::runtime_error("invalid host data supply");
     return invoke(id, data, request);
 }
@@ -180,11 +182,7 @@ ProcessResult ITrusteeTlsSessionService::invoke(SessionId id,
     operation.started = 1;
     operation.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
         TEEC_MEMREF_TEMP_OUTPUT, TEEC_VALUE_OUTPUT,
-        request ? TEEC_VALUE_INOUT : TEEC_VALUE_OUTPUT);
-    if (request) {
-        operation.params[3].value.a = request->operation;
-        operation.params[3].value.b = request->id;
-    }
+        TEEC_VALUE_OUTPUT);
     operation.params[0].tmpref.buffer = input.empty() ? &emptyInput
         : const_cast<unsigned char*>(input.data());
     operation.params[0].tmpref.size = static_cast<std::uint32_t>(input.size());
@@ -195,7 +193,7 @@ ProcessResult ITrusteeTlsSessionService::invoke(SessionId id,
     {
         std::lock_guard<std::mutex> sdkLock(impl_->contextMutex);
         result = TEEC_InvokeCommand(&session->handle,
-            request ? TLS_CMD_SUPPLY_HOST_DATA : TLS_CMD_PROCESS,
+            request ? TLS_CMD_SUPPLY_HOST_CHUNK : TLS_CMD_PROCESS,
             &operation, &origin);
     }
     if (result != TEEC_SUCCESS)

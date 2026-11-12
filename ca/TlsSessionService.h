@@ -4,15 +4,17 @@
 #include <cstdint>
 #include <vector>
 #include <optional>
+#include <functional>
+#include "host_call_dispatcher.h"
 
 namespace kunpeng {
 
 using SessionId = std::uint64_t;
 
-struct HostDataRequest {
-    std::uint32_t operation;
-    std::uint32_t id;
-};
+using HostDataRequest = HostCallRequest;
+using HostDataStatus = HostCallStatus;
+using HostDataReply = HostCallReply;
+using HostDataHandler = HostCallHandler;
 
 struct ProcessResult {
     std::vector<unsigned char> output;

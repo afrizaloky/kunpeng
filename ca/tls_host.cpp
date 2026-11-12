@@ -109,6 +109,13 @@ int main(int argc, char** argv)
 
         kunpeng::ITrusteeTlsSessionService service(taPath);
         exportCertificate(service, certificatePath);
+        kunpeng::HostCallDispatcher dispatcher;
+        dispatcher.registerHandler(1, [](const kunpeng::HostCallRequest&) {
+            const std::string data = "Public demo data from CA.\n";
+            return kunpeng::HostCallReply{kunpeng::HostCallStatus::Success,
+                {data.begin(), data.end()}};
+        });
+        settings.hostDispatcher = &dispatcher;
         kunpeng::RestAPIHost host(service, settings);
         std::atomic<int> signalError{0};
         std::thread signalThread([&] {

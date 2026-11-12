@@ -26,7 +26,7 @@ target_include_directories(itrustee_trusted INTERFACE
 target_compile_options(itrustee_trusted INTERFACE -nostdinc -march=armv8-a -Os
   -fPIC -fno-short-enums -fno-omit-frame-pointer -fstack-protector-strong
   -fno-common -fsigned-char -Wall -Wextra -Werror)
-foreach(lib tls_engine)
+foreach(lib tls_engine host_call)
   target_link_libraries(${lib} PRIVATE itrustee_trusted)
 endforeach()
 target_compile_definitions(tls_engine PRIVATE KUNPENG_ITRUSTEE)

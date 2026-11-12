@@ -5,7 +5,8 @@
 #include <stdint.h>
 #define TLS_FLAG_HOST_REQUEST 16u
 #define TLS_HOST_OP_DEMO_DATA 1u
-#define TLS_HOST_DATA_CAPACITY 128u
+#include "host_call.h"
+#define TLS_HOST_DATA_CAPACITY HOST_CALL_OBJECT_CAP
 
 typedef struct tls_host_data_request {
     uint32_t operation;
@@ -41,11 +42,11 @@ int tls_identity_certificate(tls_identity *identity, unsigned char *out,
                              size_t capacity, size_t *written);
 int tls_connection_create(tls_connection **connection, tls_identity *identity);
 void tls_connection_destroy(tls_connection *connection);
-/* Inspection returns {0,0} unless pending. Supply copies public ASCII/LF bytes
- * into owned storage; rejection leaves the pending operation unchanged. */
+/* Inspection returns {0,0} unless pending. Malformed chunks fail the connection
+ * and discard the pending object. DEMO_DATA is public binary response content. */
 int tls_connection_host_request(const tls_connection *connection, tls_host_data_request *request);
-int tls_connection_supply_host_data(tls_connection *connection,
-    const tls_host_data_request *request, const unsigned char *data, size_t size);
+int tls_connection_supply_host_chunk(tls_connection *connection,
+    const unsigned char *wire, size_t size);
 /* Ciphertext only. Input is copied into an owned queue before TLS processing;
  * input larger than remaining queue capacity is rejected atomically. Buffers
  * need remain valid only for this call (input/output may overlap). NULL buffers

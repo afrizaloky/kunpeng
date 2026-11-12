@@ -80,14 +80,18 @@ void contracts()
     boundary.flags = TLS_PROTOCOL_FLAG_HANDSHAKE;
     rejects([&] { service.process(1, {}); });
     boundary.op = 0; boundary.requestId = 0;
-    result = service.supplyHostData(1, {1, 7}, {'a', '\n'});
+    std::vector<unsigned char> wire(HOST_CALL_HEADER_SIZE + 2);
+    host_call_chunk chunk{1, 7, 0, 2, HOST_CALL_OK, 1};
+    require(host_call_encode(wire.data(), &chunk) == 0);
+    wire[HOST_CALL_HEADER_SIZE] = 'a'; wire[HOST_CALL_HEADER_SIZE + 1] = '\n';
+    result = service.supplyHostData(1, {1, 7}, wire);
     require(!result.hostRequest && result.handshake && result.output.size() == 3);
     rejects([&] { service.supplyHostData(1, {1, 0}, {'a'}); });
     rejects([&] { service.supplyHostData(1, {2, 7}, {'a'}); });
     rejects([&] { service.supplyHostData(1, {1, 7}, {}); });
     rejects([&] { service.supplyHostData(1, {1, 7}, std::vector<unsigned char>(129)); });
     boundary.failInvoke = true;
-    rejects([&] { service.supplyHostData(1, {1, 7}, {'a', '\n'}); });
+    rejects([&] { service.supplyHostData(1, {1, 7}, wire); });
     boundary.failInvoke = false;
     boundary.flags = 0;
     boundary.reserved = 1;
@@ -202,15 +206,16 @@ TEEC_Result TEEC_InvokeCommand(TEEC_Session* session, uint32_t command,
             boundary.cert.data(), boundary.cert.size());
         operation->params[0].tmpref.size = boundary.cert.size();
     } else {
-        require(command == TLS_CMD_PROCESS || command == TLS_CMD_SUPPLY_HOST_DATA);
+        require(command == TLS_CMD_PROCESS || command == TLS_CMD_SUPPLY_HOST_CHUNK);
         require(operation->paramTypes == TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
             TEEC_MEMREF_TEMP_OUTPUT, TEEC_VALUE_OUTPUT,
-            command == TLS_CMD_PROCESS ? static_cast<std::uint32_t>(TEEC_VALUE_OUTPUT)
-                                       : static_cast<std::uint32_t>(TEEC_VALUE_INOUT)));
-        if (command == TLS_CMD_SUPPLY_HOST_DATA) {
-            require(operation->params[3].value.a == 1 && operation->params[3].value.b == 7);
-            require(operation->params[0].tmpref.size == 2);
-            require(std::memcmp(operation->params[0].tmpref.buffer, "a\n", 2) == 0);
+            TEEC_VALUE_OUTPUT));
+        if (command == TLS_CMD_SUPPLY_HOST_CHUNK) {
+            host_call_chunk supplied{};
+            const auto* bytes = static_cast<const unsigned char*>(operation->params[0].tmpref.buffer);
+            require(host_call_decode(bytes, operation->params[0].tmpref.size, &supplied) == 0);
+            require(supplied.operation == 1 && supplied.id == 7 && supplied.final == 1);
+            require(std::memcmp(bytes + HOST_CALL_HEADER_SIZE, "a\n", 2) == 0);
         }
         std::unique_lock<std::mutex> lock(boundary.mutex);
         if (boundary.block) {

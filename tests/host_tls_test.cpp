@@ -83,8 +83,8 @@ public:
         const Bytes& data) override {
         {
             std::lock_guard<std::mutex> lock(mutex);
-            tls_host_data_request supplied{request.operation, request.id};
-            CHECK(tls_connection_supply_host_data(sessions.at(id), &supplied, data.data(), data.size()) == 0);
+            CHECK(request.id != 0);
+            CHECK(tls_connection_supply_host_chunk(sessions.at(id), data.data(), data.size()) == 0);
         }
         return process(id, {});
     }
@@ -109,14 +109,21 @@ public:
     }
 };
 struct Host {
+    kunpeng::HostCallDispatcher dispatcher;
     kunpeng::RestAPIHost host;
     std::future<void> finished;
     explicit Host(Engine& engine) : host(engine, config()),
         finished(std::async(std::launch::async, [&] { host.run(); })) {
         CHECK(host.waitUntilRunning(5s));
     }
-    static kunpeng::RestAPIHost::Options config() {
+    kunpeng::RestAPIHost::Options config() {
+        dispatcher.registerHandler(1, [](const kunpeng::HostCallRequest&) {
+            Bytes data(HOST_CALL_OBJECT_CAP);
+            for (std::size_t i = 0; i < data.size(); ++i) data[i] = static_cast<unsigned char>(i % 251);
+            return kunpeng::HostCallReply{kunpeng::HostCallStatus::Success, std::move(data)};
+        });
         kunpeng::RestAPIHost::Options value;
+        value.hostDispatcher = &dispatcher;
         value.port = 0;
         return value;
     }
@@ -199,10 +206,13 @@ struct Client {
             : (repeat == 0 ? "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
                            : "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
         CHECK(SSL_write(ssl.get(), request.data(), static_cast<int>(request.size())) == static_cast<int>(request.size()));
-        const std::string expected = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: "
-            + std::string(repeat == 0 ? "26" : "20") + "\r\n"
-            + std::string(repeat == 2 ? "Connection: close\r\n" : "")
-            + (repeat == 0 ? "\r\nPublic demo data from CA.\n" : "\r\nHello from the TEE!\n");
+        std::string expected = "HTTP/1.1 200 OK\r\nContent-Type: "
+            + std::string(repeat == 0 ? "application/octet-stream" : "text/plain")
+            + "\r\nContent-Length: " + std::string(repeat == 0 ? "1048576" : "20") + "\r\n"
+            + std::string(repeat == 2 ? "Connection: close\r\n" : "") + "\r\n";
+        if (repeat == 0) {
+            for (std::size_t i = 0; i < HOST_CALL_OBJECT_CAP; ++i) expected.push_back(static_cast<char>(i % 251));
+        } else expected += "Hello from the TEE!\n";
         std::string response;
         for (;;) {
             CHECK(std::chrono::steady_clock::now() < deadline);

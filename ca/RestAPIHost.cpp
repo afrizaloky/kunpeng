@@ -144,15 +144,27 @@ struct RestAPIHost::Impl {
                             !processed.handshake || processed.closed || processed.fatal ||
                             processed.output.size() > TLS_PROTOCOL_CAPACITY)
                             throw std::runtime_error("RestAPIHost: invalid host request");
-                        static const std::string publicData = "Public demo data from CA.\n";
-                        auto supplied = service.supplyHostData(job.id, request,
-                            std::vector<unsigned char>(publicData.begin(), publicData.end()));
-                        if (supplied.hostRequest ||
-                            supplied.output.size() > TLS_PROTOCOL_CAPACITY - processed.output.size())
-                            throw std::runtime_error("RestAPIHost: repeated request or excess output");
-                        processed.output.insert(processed.output.end(), supplied.output.begin(), supplied.output.end());
-                        supplied.output = std::move(processed.output);
-                        processed = std::move(supplied);
+                        if (!options.hostDispatcher)
+                            throw std::runtime_error("RestAPIHost: no host dispatcher configured");
+                        const auto reply = options.hostDispatcher->dispatch(request);
+                        if (!processed.output.empty())
+                            throw std::runtime_error("RestAPIHost: ciphertext before host supply");
+                        std::size_t offset = 0;
+                        for (unsigned chunk = 0; chunk < HOST_CALL_MAX_CHUNKS; ++chunk) {
+                            const auto wire = HostCallDispatcher::encodeChunk(request, reply, offset);
+                            const auto payload = wire.size() - HOST_CALL_HEADER_SIZE;
+                            const bool final = reply.status == HostCallStatus::Error || offset + payload == reply.data.size();
+                            processed = service.supplyHostData(job.id, request, wire);
+                            if (final) {
+                                if (processed.hostRequest) throw std::runtime_error("RestAPIHost: repeated request");
+                                break;
+                            }
+                            if (!processed.output.empty() || processed.fatal || processed.closed ||
+                                !processed.hostRequest || processed.hostRequest->id != request.id ||
+                                processed.hostRequest->operation != request.operation)
+                                throw std::runtime_error("RestAPIHost: invalid intermediate chunk response");
+                            offset += payload;
+                        }
                     }
                     result.handshake = processed.handshake;
                     result.more = processed.moreOutput;
