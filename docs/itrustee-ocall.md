@@ -97,7 +97,7 @@ The execution gate checks that dependencies are stable and pinned for the operat
 
 A custom agent is a possible transport only if the deployed TA API is documented and verified and the target's authorization policy permits it. It is a practical option only when the operation has a necessary data-dependent retrieval or measurement requirement that cannot be met by pre-supply. Give agent servicing an independently available worker so it cannot deadlock against a worker waiting for the request. Apply the same principal, selector, wrapped-record and state-transition validation as the command path. This conditional path is not a portable OCALL or a general callback guarantee.
 
-The current TLS command ABI retains `PROCESS=1` and `CERTIFICATE=2`, and adds `TLS_CMD_SUPPLY_HOST_DATA=3` for the bounded public-data demo. For a bodyless `POST /` with exactly one zero `Content-Length`, the TA parses the HTTP request and sends a `HOST_REQUEST` with operation `DEMO_DATA` and a request ID. The CA responds through command 3 with the fixed public demo data `Public demo data from CA.\n`. Only operation/ID metadata travels from TA to CA, never plaintext HTTP. The TA copies the supplied data and accepts only 1 to 128 printable ASCII bytes or LF; CR, NUL and other controls are rejected, as are replayed operation/ID pairs. It constructs the bounded HTTP response and encrypts it with TLS. One request may be pending per connection; one worker invocation dispatches at most one host request, with no recursive host requests.
+The current TLS command ABI retains `PROCESS=1` and `CERTIFICATE=2`, and uses `TLS_CMD_SUPPLY_HOST_CHUNK=4`. A bodyless `POST /` with exactly one zero `Content-Length` returns operation `DEMO_DATA=1` and a fresh request ID. The explicitly registered CLI handler returns public demo bytes. The generic receiver accepts binary chunks up to 1 MiB, including empty. One request may be pending per connection; one worker invocation dispatches at most one host request, with no recursive host requests. Command 3 is unsupported.
 
 This is an explicit continuation in the application protocol: the TA returns a host-work request, the CA supplies data in a later command, and the TA resumes TLS response processing. It does not suspend and resume an SGX enclave stack, add SGX re-entry, or provide a real SGX OCALL. The fixed demo data is untrusted response content, not an authenticated key record, and authorization must not rely on it. There is no general host-work preparation/resume protocol for key acquisition, arbitrary filesystem or network access, or request-body forwarding. That broader preparation/execution proposal remains unimplemented. Existing GET behavior, including keep-alive and explicit close, and the eight-session limit are unchanged.
 
@@ -111,9 +111,40 @@ Use `TEE_GenerateRandom(void *, size_t)` as the trusted RNG mapping, as declared
 
 KKA and KKM have different side effects and trust requirements. Do not force them into one universal OCALL or retrieval flow. Define operation-specific preparation, authorization, freshness and completion semantics for each use. Preserve idempotency only when the operation supports it, and distinguish transport failure from application failure and uncertain completion.
 
-## Proposed bounded CA-data framework
+## Implemented generic host-call framework
 
-This is a standalone design proposal for operations that need dynamically retrieved CA data, such as wrapped records fetched by the Client Application (CA), up to 1 MiB. It is not implemented by the fixed 128-byte `DEMO_DATA` continuation, and it does not change the current command ABI. In particular, it does not repurpose command 3 or claim compatibility with an existing CA or TA. A future implementation requires a coordinated CA and TA upgrade and a deliberate transport mapping.
+`include/host_call.h` / `src/host_call.c` own the binary codec and bounded receiver. `include/host_call_dispatcher.h` / `ca/HostCallDispatcher.cpp` own explicit handler registration and chunk encoding. CMake targets `host_call` and `host_call_dispatcher` link without TLS or OpenSSL. They know no HTTP commands, demo operation, TA identity, or platform agent API. The policy discussion below remains guidance for application-specific authentication and provider integration, not a claim those integrations exist.
+
+Standalone usage (no TLS headers):
+
+```cpp
+#include "host_call_dispatcher.h"
+kunpeng::HostCallDispatcher dispatcher;
+dispatcher.registerHandler(42, [](const kunpeng::HostCallRequest& request) {
+    return kunpeng::HostCallReply{kunpeng::HostCallStatus::Success, request.arguments};
+});
+kunpeng::HostCallRequest request{42, 7, {0, 255}};
+auto reply = dispatcher.dispatch(request);
+auto wire = dispatcher.encodeChunk(request, reply, 0);
+host_call_budget budget{}; // shared across this application's receiver contexts
+host_call receiver{};
+if (host_call_begin(&receiver, &budget, request.operation, request.id) == 0) {
+    if (host_call_receive(&receiver, wire.data(), wire.size()) == 0) {
+        // Only COMPLETE exposes slices. Authenticate/decode owned bytes here.
+    }
+    host_call_release(&receiver);
+}
+```
+
+Requests have operation, fresh nonzero ID, and serialized arguments bounded to 65,504 bytes; the embedding transport owns request serialization/session binding (the TLS example sends an empty-argument pair). Unknown operations return host error. Handler exceptions are transport/execution failures, not successful empty results. No automatic retry is performed. Register handlers before concurrent use. Replies use a 32-byte version-1 big-endian header: version, operation, ID, offset, status (0 success/1 host error), final (0/1), payload length, final length. Each command includes exactly the declared payload; final length equals offset plus length, otherwise zero. IDs and operations are arbitrary nonzero u32 values.
+
+The receiver requires zero initialization, explicit successful begin, 1 MiB object cap, 64 KiB command cap including header, 16 KiB minimum nonfinal chunks, and 65 chunks maximum. Empty final is valid, including after 64 nonfinal 16 KiB chunks. Every invalid chunk discards retained data; no slices expose partial content. Release handles consumption, abort, close and teardown. The caller-owned shared 2 MiB budget measures payload, excluding allocator metadata and one bounded command scratch copy. Callers serialize contexts sharing a budget. Adapters must allocate nonreused IDs; the core rejects replay against the current transfer but cannot remember arbitrary past session IDs after a new begin.
+
+The TLS consumer maps this to command 4 and one pending transfer per connection, sharing a budget per identity. Command 3 is unsupported. Host dispatcher execution occurs after returning from the TA/SDK invocation, outside their locks. The existing worker/session/deadline limits remain. Binary POST output is pumped in bounded ciphertext chunks with segmented stable SSL input buffers, followed by ordinary keep-alive GET support. Host bytes are not authenticated by framing; application-specific authentication must precede sensitive use.
+
+### Application integration guidance (not implemented provider integration)
+
+The generic framing and dispatcher above are implemented; wrapped-record acquisition, trusted decoding, freshness and cache/provider integration below remain application work. The TLS example uses the coordinated command-4 ABI, with no command-3 compatibility.
 
 ### Operations and continuation binding
 
@@ -159,13 +190,13 @@ Decode and validate records inside the TA according to their operation. For cryp
 
 Keep the CA event loop nonblocking. Dispatch retrieval through bounded workers and bounded transfer work so a large object or many small chunks cannot monopolize the host. Apply explicit per-request deadlines and cleanup, while treating host-side timeout as a host policy only: it does not prove trusted-time expiry and cannot cancel an already-entered TEE command. Teardown, aborts, transport errors, and uncertain side effects must have explicit outcomes, with no automatic replay unless the operation is known to be idempotent.
 
-A 1 MiB HTTP content object cannot fit in one existing 64 KiB ciphertext command output; the host's separate outbound queue limit also does not establish support for a whole 1 MiB response. This framework does not promise HTTP streaming. Supporting a large HTTP response would separately require a bounded TLS output pump and correct `Content-Length` or HTTP chunked-transfer framing. Binary transport can carry arbitrary bytes within its bounds; each operation's handler must still enforce its own format policy. The demo's printable-ASCII restriction remains demo-specific and is not a general binary-transport rule.
+A 1 MiB HTTP content object cannot fit in one existing 64 KiB ciphertext command output; the host's separate outbound queue limit also does not establish support for a whole 1 MiB response. This framework does not promise HTTP streaming. Supporting a large HTTP response would separately require a bounded TLS output pump and correct `Content-Length` or HTTP chunked-transfer framing. Binary transport can carry arbitrary bytes within its bounds; each operation's handler must still enforce its own format policy. The current demo accepts binary content; no printable-ASCII restriction is part of the generic transport.
 
 ### Acceptance tests and migration
 
 A future implementation should test object sizes 0, 1, the maximum payload for one 64 KiB envelope, exactly 65,536 bytes, exactly 1 MiB, and one byte over 1 MiB. Include maximum-envelope accounting, 1 MiB termination by a final zero-length chunk where permitted, one-byte-over rejection, tiny-chunk count limits, aggregate-budget admission and release, offset gaps and overlaps, wrong session/ID/operation, replay, bytes after final, terminal host error after partial data, malformed lengths and versions, abort and session-close cleanup, dynamic final length without a trusted hint, and operation-specific partial-authentication rejection. Test network GET behavior separately, including bounded TLS output and HTTP framing if large response support is added.
 
-Migration should proceed in explicit stages: first isolate the fixed demo handler from the general protocol, then implement and test the versioned bounded chunk contract, then add operation-specific decoders and cache integration for KKCS. Confirm the deployed iTrustee transport, command ABI, heap budget, authorization policy, and cancellation behavior before selecting platform bindings. No framework code or target validation is claimed here.
+Migration should proceed in explicit stages: first isolate the fixed demo handler from the general protocol, then implement and test the versioned bounded chunk contract, then add operation-specific decoders and cache integration for KKCS. Confirm the deployed iTrustee transport, command ABI, heap budget, authorization policy, and cancellation behavior before selecting platform bindings. Generic framework code is implemented; target runtime validation and provider/cache integration are not claimed here.
 
 ## Evidence index
 
@@ -188,11 +219,11 @@ Repository paths in the first column are relative to the sibling kripta-key chec
 | Bundled TA random API | `third_party/itrustee_sdk/include/TA/tee_crypto_api.h`, line 552 |
 | Bundled TA clock API declarations | `third_party/itrustee_sdk/include/TA/tee_time_api.h`, lines 25, 33, 77 |
 | Bundled TA trusted-storage object APIs | `third_party/itrustee_sdk/include/TA/tee_trusted_storage_api.h`, lines 129-165; deployment guarantees still require target validation |
-| Current TLS commands and bounded demo continuation | `include/tls_protocol.h`, `PROCESS=1`, `CERTIFICATE=2`, `TLS_CMD_SUPPLY_HOST_DATA=3`; this application command exchange is not a stack-preserving OCALL |
+| Current TLS commands and bounded demo continuation | `include/tls_protocol.h`, `PROCESS=1`, `CERTIFICATE=2`, `TLS_CMD_SUPPLY_HOST_CHUNK=4`; this application command exchange is not a stack-preserving OCALL |
 | Upstream iTrustee client agent declarations | [openeuler-mirror/itrustee_client `tee_client_ext_api.h`](https://github.com/openeuler-mirror/itrustee_client/blob/master/include/tee_client_ext_api.h), mutable `master` |
 | Agent work, authorization hook and platform-specific buffer thresholds | [openeuler-mirror/itrustee_tzdriver `agent.c`](https://github.com/openeuler-mirror/itrustee_tzdriver/blob/master/core/agent.c), mutable `master` |
 | Huawei deployment and feature-specific attestation references | [English deployment guide](https://support.huawei.com/enterprise/en/doc/EDOC1100433026/ac41e320/establishing-a-connection), [Chinese deployment guide](https://support.huawei.com/enterprise/zh/doc/EDOC1100433031/a293bf95), [API reference](https://support.huawei.com/enterprise/en/doc/EDOC1100433033/f9d418d9/apis) |
 
 ## Scope and limitations
 
-This note is based on source inspection and the references listed above. The bounded `DEMO_DATA` command is an implemented application-level continuation for public response data only; it does not demonstrate a stack-preserving OCALL, a trusted-side agent call, configured agent authorization, or a general provider/retrieval protocol. The broader preparation/execution design remains a recommendation, not an implementation, and this is not a full KKA, KKM, or KKCS port. TA time, RNG, persistent storage, signing, deployment policy, and the host-data path have not been validated on an iTrustee device or live Kunpeng runtime. Because command 3 changes the CA/TA `PROCESS` slot-3 metadata ABI, rebuild the CA and TA together, sign the resulting TA, and redeploy it as a matched pair. No backward compatibility with an older CA or TA is provided. These documents make no deployment-validation claim.
+This note is based on source inspection and the references listed above. The bounded `DEMO_DATA` command is an implemented application-level continuation for public response data only; it does not demonstrate a stack-preserving OCALL, a trusted-side agent call, configured agent authorization, or a general provider/retrieval protocol. The broader preparation/execution design remains a recommendation, not an implementation, and this is not a full KKA, KKM, or KKCS port. TA time, RNG, persistent storage, signing, deployment policy, and the host-data path have not been validated on an iTrustee device or live Kunpeng runtime. Because command 4 uses the CA/TA `PROCESS` slot-3 metadata ABI, rebuild the CA and TA together, sign the resulting TA, and redeploy it as a matched pair. No backward compatibility with an older CA or TA is provided. These documents make no deployment-validation claim.
