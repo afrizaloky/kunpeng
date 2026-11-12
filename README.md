@@ -12,7 +12,7 @@ This is a minimal demonstration, not a production service. It has no mutual TLS,
 
 - Git with recursive submodule support, CMake 3.20 or newer, a C compiler and a C++17 compiler.
 - For native tests on Linux: OpenSSL 3.5 or newer development files and the OpenSSL CLI.
-- For the TA: Perl and GNU make. Pristine OpenSSL 3.5.0 sources are bundled in `third_party/openssl-3.5.0.tar.gz`, including the Apache License 2.0 text at `openssl-3.5.0/LICENSE.txt` inside the archive. CMake uses this archive by default and verifies SHA-256 `344d0a79f1a9b08029b0744e2cc401a43f9c90acd1044d09a530b4885a8e9fc0`. An explicit `KUNPENG_OPENSSL_ARCHIVE` override is still supported with the same checksum requirement. No external SGX checkout or prebuilt x86 library archive is needed.
+- For the TA: Perl and GNU make. During iTrustee configuration, CMake FetchContent downloads pristine OpenSSL 3.5.0 sources from openssl.org and verifies SHA-256 `344d0a79f1a9b08029b0744e2cc401a43f9c90acd1044d09a530b4885a8e9fc0`. The sources include the Apache License 2.0 text at `LICENSE.txt`; an initial TA configuration therefore requires network access. No external SGX checkout or prebuilt x86 library archive is needed.
 - For the iTrustee build: the Huawei iTrustee SDK as the `third_party/itrustee_sdk` submodule, an AArch64 Linux cross-compiler, and the SDK inputs checked by CMake, including the TA linker script, TA headers and SDK musl headers. The upstream SDK's general sample-build instructions also list `libboundscheck`; this project's sources do not currently call it, and CMake does not check or fetch it. If your SDK variant needs it, provision the matching dependency according to that SDK's instructions.
 - For the CA at runtime: the target iTrustee environment and its `/usr/lib64/libteec.so` runtime library. The project compiles the SDK CA adaptor, but does not package or provide the target runtime library or the iTrustee service infrastructure.
 - For signing: Python 3, the SDK signer dependencies `pycryptodome` and `gmssl`, and the OpenSSL CLI used by the signer. You also need your own signing private key and Huawei-signed configuration/trust chain. The SDK's `config_cloud.ini` is a reference only. Do not copy its example key material or invent credentials.
@@ -21,7 +21,7 @@ No package manager or installation command is assumed here because the correct s
 
 ## Get the source
 
-Replace `<repository-url>` below with this project's Git URL. Clone with submodules so the iTrustee SDK is present. OpenSSL TA sources are included in the bundled archive; the SDK, toolchain and other prerequisites above are still required:
+Replace `<repository-url>` below with this project's Git URL. Clone with submodules so the iTrustee SDK is present. OpenSSL TA sources are fetched and checksum-verified when configuring the iTrustee build; network access is required. The SDK, toolchain and other prerequisites above are still required:
 
 ```sh
 git clone --recurse-submodules <repository-url>
@@ -38,7 +38,7 @@ The iTrustee SDK documents Kunpeng ARM servers as a supported target and describ
 
 ## Native Linux build and test
 
-Build out of source. The default build is for native development and runs the TLS integration test. It uses installed system OpenSSL 3.5 or newer, not the bundled TA source archive, and does not build the iTrustee TA.
+Build out of source. The default build is for native development and runs the TLS integration test. It uses installed system OpenSSL 3.5 or newer and does not download TA sources or build the iTrustee TA.
 
 ```sh
 cmake -S . -B build/native -DCMAKE_BUILD_TYPE=Release
@@ -180,6 +180,37 @@ Replace `SERVER_IP` and `/path/to/independently-verified-server.pem` with the re
 The CLI preserves `--certificate-out FILE` (required), `--port PORT` (default 8443), `--bind IPv4` (default 127.0.0.1), `--ta PATH` (optional), and `--help`. `--workers N` selects 1..32 workers (default 4); `--max-connections N` selects 1..8 admitted clients (default 8), bounded by the TA session cap. Numeric options require positive decimal integers. Certificate export completes before the listener starts, and export/startup errors return nonzero.
 
 The host bounds pending work to 16 queued jobs and 1 MiB of queued input, with a 256 KiB per-client outbound limit. Its default handshake deadline and idle timeout are each 15 seconds; these are host-level deadlines, not individual blocking socket operation timeouts. Queue saturation applies backpressure rather than allowing unbounded allocation. SIGINT (Ctrl-C) and SIGTERM request graceful shutdown through a blocked-signal waiter; the host stops and joins its workers before destroying the iTrustee backend. These concurrency and shutdown paths are exercised by native tests with test backends, not a live iTrustee device.
+
+## k6 load test
+
+First confirm that the running server returns the expected response. Then run:
+
+```sh
+k6 run --summary-mode full tests/load_test.js
+```
+
+The defaults are 2 virtual users for 30 seconds against `https://localhost:8443/`, using TLS 1.3. Certificate verification is skipped by default for this load test, as requested; this does not authenticate the server. Each request uses a fresh TCP/TLS connection (`noConnectionReuse: true`), and the server also sends `Connection: close`. This is a handshake-load test, not an HTTP keep-alive test.
+
+```sh
+k6 run --summary-mode full \
+  -e URL=https://localhost:8443/ \
+  -e VUS=2 -e DURATION=60s -e TLS_VERSION=tls1.3 \
+  -e P95_MS=1000 -e FAILURE_RATE=0.01 \
+  tests/load_test.js
+```
+
+`VUS`, `DURATION`, `URL`, `TLS_VERSION` (`tls1.2` or `tls1.3`), `P95_MS`, `FAILURE_RATE`, and `INSECURE_SKIP_TLS_VERIFY` are configurable environment inputs. Keep VUs within the host's admitted connection limit for a normal capacity measurement; exceeding it deliberately measures overload/rejections. Requests have a 10-second timeout and do not follow redirects.
+
+The summary reports p50, p90, p95, and p99 for request duration and TLS handshake timing. All checks must pass: HTTP 200, exact `Hello from the TEE!\n` body, and the requested TLS version. HTTP failures must remain below `FAILURE_RATE`; both request-duration and handshake p95 must remain below `P95_MS` milliseconds. `http_req_duration` excludes connection establishment and TLS negotiation; use `http_req_tls_handshaking` and `iteration_duration` to interpret those costs. Run with `--summary-mode full` to display all timing metrics on k6 versions supporting that option.
+
+To enable certificate verification on Linux:
+
+```sh
+SSL_CERT_FILE=/var/tmp/kunpeng-tls-server.pem \
+  k6 run --summary-mode full -e INSECURE_SKIP_TLS_VERIFY=false tests/load_test.js
+```
+
+The certificate must match the current TA identity and URL hostname. k6 checks the TLS version but this script does not select or assert the negotiated key-exchange group. Verify hybrid PQC separately with the OpenSSL command above before interpreting load results as hybrid-PQC performance. Local fixture smoke tests validate the script, not Kunpeng throughput.
 
 ## Integration with kripta-key
 
