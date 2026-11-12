@@ -85,7 +85,13 @@ static void cohort(tls_identity *identity, SSL_CTX *context, const struct policy
     memset(headers, 'a', sizeof(headers));
     memcpy(headers, "GET / HTTP/1.1\r\nX: ", 19);
     memcpy(headers + sizeof(headers) - 4, "\r\n\r\n", 4);
+    for (unsigned request = 0; request < 3; ++request) {
+    if (request == 2) {
+        memcpy(headers, "GET / HTTP/1.1\r\nConnection: close\r\nX: ", 38);
+    }
     for (size_t i = 0; i < TLS_MAX_SESSIONS; ++i) {
+        pairs[i].used = 0;
+        pairs[i].closed = 0;
         SSL *client = pairs[i].client;
         CHECK(SSL_version(client) == policy->version);
         const char *group = SSL_group_to_name(client, SSL_get_negotiated_group(client));
@@ -108,6 +114,11 @@ static void cohort(tls_identity *identity, SSL_CTX *context, const struct policy
             if (result > 0) {
                 p->used += (size_t)result;
                 CHECK(p->used < sizeof(p->response));
+                if (request != 2 && p->used == sizeof("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n\r\nHello from the TEE!\n") - 1) {
+                    CHECK(!(p->flags & TLS_FLAG_CLOSED));
+                    p->closed = 1;
+                    ++closed;
+                }
             } else if (SSL_get_error(p->client, result) == SSL_ERROR_ZERO_RETURN) {
                 CHECK(p->flags & TLS_FLAG_CLOSED);
                 p->closed = 1;
@@ -116,10 +127,15 @@ static void cohort(tls_identity *identity, SSL_CTX *context, const struct policy
         }
     }
     CHECK(closed == TLS_MAX_SESSIONS);
-    static const char expected[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nConnection: close\r\n\r\nHello from the TEE!\n";
+    const char *expected = request == 2
+        ? "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nConnection: close\r\n\r\nHello from the TEE!\n"
+        : "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n\r\nHello from the TEE!\n";
     for (size_t i = 0; i < TLS_MAX_SESSIONS; ++i) {
-        CHECK(pairs[i].used == sizeof(expected) - 1);
-        CHECK(memcmp(pairs[i].response, expected, sizeof(expected) - 1) == 0);
+        CHECK(pairs[i].used == strlen(expected));
+        CHECK(memcmp(pairs[i].response, expected, strlen(expected)) == 0);
+    }
+    }
+    for (size_t i = 0; i < TLS_MAX_SESSIONS; ++i) {
         tls_connection_destroy(pairs[i].server);
         SSL_free(pairs[i].client);
     }

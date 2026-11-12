@@ -181,20 +181,30 @@ struct Client {
         CHECK(SSL_version(ssl.get()) == TLS1_3_VERSION);
         const char* group = SSL_group_to_name(ssl.get(), SSL_get_negotiated_group(ssl.get()));
         CHECK(group != nullptr && std::string(group) == "X25519MLKEM768");
-        constexpr char request[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        CHECK(SSL_write(ssl.get(), request, sizeof(request) - 1) == sizeof(request) - 1);
+        for (unsigned repeat = 0; repeat < 3; ++repeat) {
+        const std::string request = repeat == 2
+            ? "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            : "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        CHECK(SSL_write(ssl.get(), request.data(), static_cast<int>(request.size())) == static_cast<int>(request.size()));
+        const std::string expected = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n"
+            + std::string(repeat == 2 ? "Connection: close\r\n" : "") + "\r\nHello from the TEE!\n";
         std::string response;
         for (;;) {
             CHECK(std::chrono::steady_clock::now() < deadline);
             char buffer[4096];
             const int count = SSL_read(ssl.get(), buffer, sizeof(buffer));
-            if (count > 0) { response.append(buffer, static_cast<std::size_t>(count)); continue; }
+            if (count > 0) {
+                response.append(buffer, static_cast<std::size_t>(count));
+                if (repeat != 2 && response.size() >= expected.size()) break;
+                continue;
+            }
             const int error = SSL_get_error(ssl.get(), count);
             if (error == SSL_ERROR_ZERO_RETURN) break;
             CHECK(error == SSL_ERROR_WANT_READ);
             exchange();
         }
-        CHECK(response == "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nConnection: close\r\n\r\nHello from the TEE!\n");
+        CHECK(response == expected);
+        }
     }
 };
 } // namespace

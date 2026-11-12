@@ -109,6 +109,8 @@ static void session(tls_identity *identity, const struct session_policy *policy,
     CHECK(peer != NULL);
     CHECK(X509_check_host(peer, "localhost", 0, 0, NULL) == 1);
     X509_free(peer);
+    static const char persistent[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n\r\nHello from the TEE!\n";
+    for (unsigned repeat = 0; repeat < (request->accepted == 2 ? 3u : 1u); ++repeat) {
     for (size_t offset = 0; offset < request->size;) {
         int result = SSL_write(client, request->bytes + offset, 1);
         CHECK(result == 1);
@@ -122,18 +124,30 @@ static void session(tls_identity *identity, const struct session_policy *policy,
         int server_result = exchange(server, client, &flags);
         if (server_result < 0) {
             CHECK(!request->accepted);
+            CHECK(server_result == -3);
             CHECK(flags & TLS_FLAG_CLOSED);
             CHECK(used == 0);
             closed = 1;
             break;
         }
         int result = SSL_read(client, response + used, (int)(sizeof(response) - used));
-        if (result > 0) { used += (size_t)result; CHECK(used < sizeof(response)); continue; }
+        if (result > 0) {
+            used += (size_t)result;
+            CHECK(used < sizeof(response));
+            if (request->accepted == 2 && used == sizeof(persistent) - 1) break;
+            continue;
+        }
         int error = SSL_get_error(client, result);
         if (error == SSL_ERROR_ZERO_RETURN) { closed = 1; break; }
         CHECK(error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE);
         CHECK(before > 0 || BIO_ctrl_pending(incoming) > 0 || (flags & TLS_FLAG_MORE_OUTPUT));
     }
+    if (request->accepted == 2) {
+        CHECK(!closed);
+        CHECK(!(flags & TLS_FLAG_CLOSED));
+        CHECK(used == sizeof(persistent) - 1);
+        CHECK(memcmp(response, persistent, used) == 0);
+    } else {
     CHECK(closed);
     if (request->accepted) {
         CHECK(used == sizeof(expected) - 1);
@@ -142,7 +156,23 @@ static void session(tls_identity *identity, const struct session_policy *policy,
         CHECK(used == 0);
         CHECK(flags & TLS_FLAG_CLOSED);
     }
+    }
     CHECK(flags & TLS_FLAG_HANDSHAKE);
+    }
+    if (request->accepted == 2) {
+        CHECK(SSL_shutdown(client) == 0);
+        int closed = 0;
+        for (unsigned step = 0; step < 20000; ++step) {
+            CHECK(exchange(server, client, &flags) == 0);
+            char byte;
+            int result = SSL_read(client, &byte, 1);
+            CHECK(result <= 0);
+            int error = SSL_get_error(client, result);
+            if (error == SSL_ERROR_ZERO_RETURN) { closed = 1; break; }
+            CHECK(error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE);
+        }
+        CHECK(closed && (flags & TLS_FLAG_CLOSED));
+    }
     tls_connection_destroy(server);
     SSL_free(client);
 }
@@ -243,12 +273,22 @@ int main(void)
     CHECK(X509_STORE_add_cert(SSL_CTX_get_cert_store(context), certificate) == 1);
     X509_free(certificate);
     BIO_free(source);
-    static const char valid[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const struct request_case keepalive = {"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", 35, 2};
+    session(identity, &baseline, &keepalive);
+    const char *persistent_cases[] = {
+        "GET / HTTP/1.1\r\nConnection: xclose, keep-alive\r\ncOnNeCtIoN: upgrade\r\n\r\n",
+        "GET / HTTP/1.1\r\ncOnTeNt-LeNgTh: \t000\t\r\n\r\n"
+    };
+    for (size_t i = 0; i < sizeof(persistent_cases) / sizeof(persistent_cases[0]); ++i) {
+        const struct request_case request = {persistent_cases[i], strlen(persistent_cases[i]), 2};
+        session(identity, &baseline, &request);
+    }
+    static const char valid[] = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     static const char nul_method[] = "GE\0T / HTTP/1.1\r\nHost: localhost\r\n\r\n";
     static const char nul_header[] = "GET / HTTP/1.1\r\nHo\0st: localhost\r\n\r\n";
     char maximum[4096];
     memset(maximum, 'a', sizeof(maximum));
-    memcpy(maximum, "GET / HTTP/1.1\r\nX: ", 19);
+    memcpy(maximum, "GET / HTTP/1.1\r\nConnection: close\r\nX: ", 38);
     memcpy(maximum + sizeof(maximum) - 4, "\r\n\r\n", 4);
     char excessive[4097];
     memset(excessive, 'a', sizeof(excessive));
@@ -265,6 +305,33 @@ int main(void)
     for (unsigned int i = 0; i < 3; ++i) session(identity, &baseline, &requests[0]);
     for (size_t i = 1; i < sizeof(requests) / sizeof(requests[0]); ++i)
         session(identity, &baseline, &requests[i]);
+    const char *close_cases[] = {
+        "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+        "GET / HTTP/1.1\r\nConnection: keep-alive, ClOsE\r\nConnection: keep-alive\r\n\r\n",
+        "GET / HTTP/1.1\r\nConnection: keep-alive\r\nCONNECTION: upgrade,\tCLOSE \r\n\r\n"
+    };
+    for (size_t i = 0; i < sizeof(close_cases) / sizeof(close_cases[0]); ++i) {
+        const struct request_case request = {close_cases[i], strlen(close_cases[i]), 1};
+        session(identity, &baseline, &request);
+    }
+    const char *rejected_cases[] = {
+        "HEAD / HTTP/1.1\r\n\r\n", "POST / HTTP/1.1\r\n\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: 0, 0\r\n\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: 1\r\n\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: +0\r\n\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: \r\n\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: 184467440737095516160\r\n\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: \r\n\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: 0\r\ntRaNsFeR-EnCoDiNg: identity\r\n\r\n"
+    };
+    for (size_t i = 0; i < sizeof(rejected_cases) / sizeof(rejected_cases[0]); ++i) {
+        const struct request_case request = {rejected_cases[i], strlen(rejected_cases[i]), 0};
+        session(identity, &baseline, &request);
+    }
+    session(identity, &(struct session_policy){hybrid, TLS1_3_VERSION,
+        "TLS_AES_256_GCM_SHA384", "X25519MLKEM768"}, &keepalive);
     const char *groups[] = {
         "X25519MLKEM768", "SecP256r1MLKEM768", "SecP384r1MLKEM1024",
         "x25519", "x448", "secp256r1", "secp384r1", "secp521r1", "ffdhe3072"

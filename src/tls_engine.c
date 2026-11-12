@@ -62,9 +62,14 @@ struct tls_connection {
     size_t response_offset;
     int handshake;
     int write_pending;
+    int close_after_response;
     int state; /* 0: handshake/headers, 1: response, 2: close, 3: closed */
     int error;
 };
+
+static const unsigned char persistent_response[] =
+    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n"
+    "\r\nHello from the TEE!\n";
 
 static const unsigned char response[] =
     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n"
@@ -284,10 +289,25 @@ static int token(unsigned char c)
            (c != 0 && strchr("!#$%&'*+-.^_`|~", (int)c) != NULL);
 }
 
-static int valid_headers(const unsigned char *data, size_t size)
+static int equal_header(const unsigned char *data, size_t size, const char *name)
 {
+    if (size != strlen(name)) { return 0; }
+    for (size_t i = 0; i < size; ++i) {
+        unsigned char c = data[i];
+        if (c >= 'A' && c <= 'Z') { c += 'a' - 'A'; }
+        if (c != (unsigned char)name[i]) { return 0; }
+    }
+    return 1;
+}
+
+static int valid_headers(tls_connection *connection)
+{
+    const unsigned char *data = connection->headers;
+    size_t size = connection->header_size;
     size_t i = 0;
     size_t start;
+    int content_length = 0;
+    if (size < 4 || memcmp(data, "GET ", 4) != 0) { return 0; }
     while (i < size && token(data[i])) { ++i; }
     if (i == 0 || i >= size || data[i++] != ' ') { return 0; }
     start = i;
@@ -296,16 +316,43 @@ static int valid_headers(const unsigned char *data, size_t size)
     if (size - i < 10 || memcmp(data + i, "HTTP/1.", 7) != 0 ||
         (data[i + 7] != '0' && data[i + 7] != '1') ||
         data[i + 8] != '\r' || data[i + 9] != '\n') { return 0; }
+    connection->close_after_response = data[i + 7] == '0';
     i += 10;
     while (size - i > 2) {
         start = i;
         while (i < size && token(data[i])) { ++i; }
         if (i == start || i >= size || data[i++] != ':') { return 0; }
+        size_t name_size = i - start - 1;
+        size_t value = i;
         while (i < size && data[i] != '\r') {
             if ((data[i] < 0x20 && data[i] != '\t') || data[i] == 0x7f) { return 0; }
             ++i;
         }
         if (size - i < 2 || data[i + 1] != '\n') { return 0; }
+        size_t end = i;
+        while (value < end && (data[value] == ' ' || data[value] == '\t')) { ++value; }
+        while (end > value && (data[end - 1] == ' ' || data[end - 1] == '\t')) { --end; }
+        if (equal_header(data + start, name_size, "transfer-encoding")) { return 0; }
+        if (equal_header(data + start, name_size, "content-length")) {
+            if (content_length++ || value == end) { return 0; }
+            /* Only decimal zero is bodyless; no integer conversion can overflow. */
+            for (size_t j = value; j < end; ++j) {
+                if (data[j] != '0') { return 0; }
+            }
+        }
+        if (equal_header(data + start, name_size, "connection")) {
+            while (value < end) {
+                size_t part = value;
+                while (value < end && data[value] != ',') { ++value; }
+                size_t part_end = value;
+                while (part < part_end && (data[part] == ' ' || data[part] == '\t')) { ++part; }
+                while (part_end > part && (data[part_end - 1] == ' ' || data[part_end - 1] == '\t')) { --part_end; }
+                if (equal_header(data + part, part_end - part, "close")) {
+                    connection->close_after_response = 1;
+                }
+                if (value < end) { ++value; }
+            }
+        }
         i += 2;
     }
     return size - i == 2 && data[i] == '\r' && data[i + 1] == '\n';
@@ -341,16 +388,23 @@ static int advance(tls_connection *connection)
             connection->headers[connection->header_size++] = byte;
             if (connection->header_size >= 4 &&
                 memcmp(connection->headers + connection->header_size - 4, "\r\n\r\n", 4) == 0) {
-                if (!valid_headers(connection->headers, connection->header_size)) { return ENGINE_HTTP; }
+                if (!valid_headers(connection)) { return ENGINE_HTTP; }
                 OPENSSL_cleanse(connection->headers, sizeof(connection->headers));
                 connection->state = 1;
             } else if (connection->header_size == sizeof(connection->headers)) { return ENGINE_HTTP; }
         } else if (connection->state == 1) {
-            ret = SSL_write(connection->ssl, response + connection->response_offset,
-                            (int)(sizeof(response) - 1 - connection->response_offset));
+            const unsigned char *bytes = connection->close_after_response ? response : persistent_response;
+            size_t size = connection->close_after_response ? sizeof(response) - 1 : sizeof(persistent_response) - 1;
+            ret = SSL_write(connection->ssl, bytes + connection->response_offset,
+                             (int)(size - connection->response_offset));
             if (ret <= 0) { return ssl_result(connection, ret); }
             connection->response_offset += (size_t)ret;
-            if (connection->response_offset == sizeof(response) - 1) { connection->state = 2; }
+            if (connection->response_offset == size) {
+                connection->state = connection->close_after_response ? 2 : 0;
+                connection->header_size = 0;
+                connection->response_offset = 0;
+                connection->close_after_response = 0;
+            }
         } else if (connection->state == 2) {
             ret = SSL_shutdown(connection->ssl);
             /* One-way close: do not wait for the peer's close_notify. */
