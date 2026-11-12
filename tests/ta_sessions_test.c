@@ -123,7 +123,7 @@ static void *run_job(void *argument)
             TEE_PARAM_TYPES(6, 0, 0, 0), params) == TEE_SUCCESS);
         CHECK(output[0] == 42 && params[0].memref.size == 1);
     } else if (job->operation == 2) {
-        CHECK(TA_OpenSessionEntryPoint(0, NULL, &job->context) == TEE_SUCCESS);
+        CHECK(TA_OpenSessionEntryPoint(TEE_PARAM_TYPES(0, 0, 5, 5), NULL, &job->context) == TEE_SUCCESS);
     } else {
         TA_CloseSessionEntryPoint(job->context); job->context = NULL;
     }
@@ -132,18 +132,35 @@ static void *run_job(void *argument)
 int main(void)
 {
     void *contexts[TLS_MAX_SESSIONS] = {0}, *extra = NULL;
-    CHECK(TA_OpenSessionEntryPoint(0, NULL, &extra) == TEE_ERROR_BAD_STATE);
+    CHECK(TA_OpenSessionEntryPoint(TEE_PARAM_TYPES(0, 0, 5, 5), NULL, &extra) == TEE_ERROR_BAD_STATE);
     CHECK(TA_CreateEntryPoint() == TEE_SUCCESS);
+    /* Only the driver-injected INPUT identity slots are accepted. */
+    unsigned before_reject = entered;
+    CHECK(TA_OpenSessionEntryPoint(TEE_PARAM_TYPES(0, 0, 5, 5), NULL, NULL) ==
+        TEE_ERROR_BAD_PARAMETERS);
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        for (unsigned type = 0; type < 16; ++type) {
+            unsigned expected = slot < 2 ? TEE_PARAM_TYPE_NONE : TEE_PARAM_TYPE_MEMREF_INPUT;
+            if (type == expected) continue;
+            uint32_t types = (0x5500u & ~(0xfu << (slot * 4))) | (type << (slot * 4));
+            extra = &before_reject;
+            CHECK(TA_OpenSessionEntryPoint(types, NULL, &extra) == TEE_ERROR_BAD_PARAMETERS);
+            CHECK(extra == NULL && entered == before_reject && live == 0);
+        }
+    }
+    extra = &before_reject;
+    CHECK(TA_OpenSessionEntryPoint(0, NULL, &extra) == TEE_ERROR_BAD_PARAMETERS);
+    CHECK(extra == NULL && entered == before_reject && live == 0);
     fail_create = 1;
-    CHECK(TA_OpenSessionEntryPoint(0, NULL, &extra) == TEE_ERROR_GENERIC && extra == NULL);
+    CHECK(TA_OpenSessionEntryPoint(TEE_PARAM_TYPES(0, 0, 5, 5), NULL, &extra) == TEE_ERROR_GENERIC && extra == NULL);
     for (unsigned i = 0; i < TLS_MAX_SESSIONS; ++i) {
-        CHECK(TA_OpenSessionEntryPoint(0, NULL, &contexts[i]) == TEE_SUCCESS);
+        CHECK(TA_OpenSessionEntryPoint(TEE_PARAM_TYPES(0, 0, 5, 5), NULL, &contexts[i]) == TEE_SUCCESS);
         for (unsigned j = 0; j < i; ++j) CHECK(contexts[i] != contexts[j]);
     }
     CHECK(live == TLS_MAX_SESSIONS);
-    CHECK(TA_OpenSessionEntryPoint(0, NULL, &extra) == TEE_ERROR_BUSY && extra == NULL);
+    CHECK(TA_OpenSessionEntryPoint(TEE_PARAM_TYPES(0, 0, 5, 5), NULL, &extra) == TEE_ERROR_BUSY && extra == NULL);
     TA_CloseSessionEntryPoint(contexts[7]);
-    CHECK(TA_OpenSessionEntryPoint(0, NULL, &contexts[7]) == TEE_SUCCESS);
+    CHECK(TA_OpenSessionEntryPoint(TEE_PARAM_TYPES(0, 0, 5, 5), NULL, &contexts[7]) == TEE_SUCCESS);
     for (unsigned i = 3; i < TLS_MAX_SESSIONS; ++i) TA_CloseSessionEntryPoint(contexts[i]);
 
     pthread_t threads[4];
@@ -168,7 +185,7 @@ int main(void)
     TA_CloseSessionEntryPoint(contexts[0]); TA_CloseSessionEntryPoint(contexts[1]);
     TA_CloseSessionEntryPoint(jobs[2].context);
     CHECK(live == 0 && identities == 1);
-    CHECK(TA_OpenSessionEntryPoint(0, NULL, &extra) == TEE_SUCCESS);
+    CHECK(TA_OpenSessionEntryPoint(TEE_PARAM_TYPES(0, 0, 5, 5), NULL, &extra) == TEE_SUCCESS);
     TA_CloseSessionEntryPoint(extra);
     TA_DestroyEntryPoint(); CHECK(identities == 0);
     puts("TA sessions: cap, allocation rollback, slot reuse, identity lifetime and serialization passed");

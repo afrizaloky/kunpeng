@@ -1,7 +1,8 @@
-gpd.ta.appID: 1f8c4d90-7b36-4e21-a509-6d2c83f047b1
-gpd.ta.service_name: kunpeng-tls
-gpd.ta.singleInstance: true
-gpd.ta.multiSession: true
-gpd.ta.instanceKeepAlive: true
-gpd.ta.dataSize: 2097152
-gpd.ta.stackSize: 65536
+gpd.ta.appID:              e08f7eca-e875-440e-9ab0-5f381136c600
+gpd.ta.service_name:       attestation-service
+gpd.ta.singleInstance:     true
+gpd.ta.multiSession:       false
+gpd.ta.instanceKeepAlive:  false
+gpd.ta.dataSize:           67928064
+gpd.ta.stackSize:          40960
+gpd.ta.sys_verify_ta:      true

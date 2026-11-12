@@ -1,2 +1,6 @@
 /build/
 .omo
+.cache
+config
+config_cloud.ini
+private_key.pem

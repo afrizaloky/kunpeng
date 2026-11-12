@@ -46,10 +46,14 @@ TEE_Result TA_OpenSessionEntryPoint(uint32_t types, TEE_Param params[4], void **
 {
     tls_connection *connection = NULL;
     (void)params;
-    if (context == NULL || types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
-        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE))
+    if (context == NULL)
         return TEE_ERROR_BAD_PARAMETERS;
     *context = NULL;
+    /* TEEC_LOGIN_IDENTIFY reserves slots 2/3 for driver-injected identity inputs.
+     * Caller authorization remains the addcaller_ca_exec allowlist, not these bytes. */
+    if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
+        TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_INPUT))
+        return TEE_ERROR_BAD_PARAMETERS;
     if (pthread_mutex_lock(&engine_mutex) != 0)
         return TEE_ERROR_GENERIC;
     TEE_Result result;

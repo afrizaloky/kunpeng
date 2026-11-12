@@ -1,5 +1,5 @@
 # Build pristine upstream sources, never SGX-patched sources or prebuilt archives.
-set(KUNPENG_OPENSSL_ARCHIVE "" CACHE FILEPATH "Pristine OpenSSL 3.5.0 source tar.gz")
+set(KUNPENG_OPENSSL_ARCHIVE "${PROJECT_SOURCE_DIR}/third_party/openssl-3.5.0.tar.gz" CACHE FILEPATH "Pristine OpenSSL 3.5.0 source tar.gz")
 if(NOT EXISTS "${KUNPENG_OPENSSL_ARCHIVE}")
   message(FATAL_ERROR "Set KUNPENG_OPENSSL_ARCHIVE to the local pristine openssl-3.5.0.tar.gz")
 endif()

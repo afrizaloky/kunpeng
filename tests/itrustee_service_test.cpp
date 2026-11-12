@@ -149,7 +149,7 @@ TEEC_Result TEEC_OpenSession(TEEC_Context* context, TEEC_Session* session,
 {
     Operation guard;
     require(login == TEEC_LOGIN_IDENTIFY && data == nullptr);
-    require(uuid->timeLow == 0x1f8c4d90 && operation->started == 1);
+    require(uuid->timeLow == 0xe08f7eca && operation->started == 1);
     if (boundary.failOpen) return TEEC_ERROR_GENERIC;
     session->context = context;
     session->session_id = ++boundary.next;
