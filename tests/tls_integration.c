@@ -61,11 +61,19 @@ struct request_case {
     int accepted;
 };
 
-static void session(tls_identity *identity, SSL_CTX *context, const struct request_case *request)
+/* SIZE_OK: shared wire-level fixture keeps protocol cases on the same assertions. */
+struct session_policy {
+    SSL_CTX *context;
+    int version;
+    const char *cipher;
+    const char *group;
+};
+
+static void session(tls_identity *identity, const struct session_policy *policy, const struct request_case *request)
 {
     static const char expected[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nConnection: close\r\n\r\nHello from the TEE!\n";
     tls_connection *server = NULL;
-    SSL *client = SSL_new(context);
+    SSL *client = SSL_new(policy->context);
     BIO *incoming = BIO_new(BIO_s_mem()), *outgoing = BIO_new(BIO_s_mem());
     CHECK(client && incoming && outgoing);
     SSL_set_bio(client, incoming, outgoing);
@@ -90,8 +98,12 @@ static void session(tls_identity *identity, SSL_CTX *context, const struct reque
         CHECK(before > 0 || BIO_ctrl_pending(incoming) > 0 || (flags & TLS_FLAG_MORE_OUTPUT));
     }
     CHECK(complete);
-    CHECK(SSL_version(client) == TLS1_2_VERSION);
-    CHECK(strcmp(SSL_get_cipher_name(client), "ECDHE-ECDSA-AES128-GCM-SHA256") == 0);
+    CHECK(SSL_version(client) == policy->version);
+    CHECK(strcmp(SSL_get_cipher_name(client), policy->cipher) == 0);
+    const char *group = SSL_group_to_name(client, SSL_get_negotiated_group(client));
+    if (group == NULL || strcmp(group, policy->group) != 0)
+        fprintf(stderr, "negotiated group %s, expected %s\n", group ? group : "(none)", policy->group);
+    CHECK(group != NULL && strcmp(group, policy->group) == 0);
     CHECK(SSL_get_verify_result(client) == X509_V_OK);
     X509 *peer = SSL_get1_peer_certificate(client);
     CHECK(peer != NULL);
@@ -215,6 +227,18 @@ int main(void)
     CHECK(certificate);
     SSL_CTX *context = SSL_CTX_new(TLS_client_method());
     CHECK(context);
+    CHECK(SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION));
+    CHECK(SSL_CTX_set_max_proto_version(context, TLS1_2_VERSION));
+    CHECK(SSL_CTX_set1_groups_list(context, "P-256"));
+    const struct session_policy baseline = {
+        context, TLS1_2_VERSION, "ECDHE-ECDSA-AES128-GCM-SHA256", "secp256r1"
+    };
+    SSL_CTX *hybrid = SSL_CTX_new(TLS_client_method());
+    CHECK(hybrid);
+    CHECK(SSL_CTX_set_min_proto_version(hybrid, TLS1_3_VERSION));
+    CHECK(SSL_CTX_set_max_proto_version(hybrid, TLS1_3_VERSION));
+    SSL_CTX_set_verify(hybrid, SSL_VERIFY_PEER, NULL);
+    CHECK(X509_STORE_add_cert(SSL_CTX_get_cert_store(hybrid), certificate) == 1);
     SSL_CTX_set_verify(context, SSL_VERIFY_PEER, NULL);
     CHECK(X509_STORE_add_cert(SSL_CTX_get_cert_store(context), certificate) == 1);
     X509_free(certificate);
@@ -238,9 +262,56 @@ int main(void)
         {excessive, sizeof(excessive), 0},
         {"GET / HTTP/1.1\r\n Fold: bad\r\n\r\n", sizeof("GET / HTTP/1.1\r\n Fold: bad\r\n\r\n") - 1, 0},
     };
-    for (unsigned int i = 0; i < 3; ++i) session(identity, context, &requests[0]);
+    for (unsigned int i = 0; i < 3; ++i) session(identity, &baseline, &requests[0]);
     for (size_t i = 1; i < sizeof(requests) / sizeof(requests[0]); ++i)
-        session(identity, context, &requests[i]);
+        session(identity, &baseline, &requests[i]);
+    const char *groups[] = {
+        "X25519MLKEM768", "SecP256r1MLKEM768", "SecP384r1MLKEM1024",
+        "x25519", "x448", "secp256r1", "secp384r1", "secp521r1", "ffdhe3072"
+    };
+    const char *suites[] = {
+        "TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256", "TLS_CHACHA20_POLY1305_SHA256"
+    };
+    for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); ++i) {
+        CHECK(SSL_CTX_set1_groups_list(hybrid, groups[i]));
+        CHECK(SSL_CTX_set_ciphersuites(hybrid, suites[0]));
+        const struct session_policy policy = {hybrid, TLS1_3_VERSION, suites[0], groups[i]};
+        session(identity, &policy, &requests[0]);
+    }
+    CHECK(SSL_CTX_set1_groups_list(hybrid, "X25519MLKEM768"));
+    for (size_t i = 1; i < sizeof(suites) / sizeof(suites[0]); ++i) {
+        CHECK(SSL_CTX_set_ciphersuites(hybrid, suites[i]));
+        const struct session_policy policy = {hybrid, TLS1_3_VERSION, suites[i], "X25519MLKEM768"};
+        session(identity, &policy, &requests[0]);
+    }
+    CHECK(SSL_CTX_set_ciphersuites(hybrid, suites[0]));
+    CHECK(SSL_CTX_set1_groups_list(hybrid, "*X25519:X25519MLKEM768"));
+    const struct session_policy preferred = {hybrid, TLS1_3_VERSION, suites[0], "X25519MLKEM768"};
+    session(identity, &preferred, &requests[0]);
+    const char *excluded[] = {"ffdhe2048"};
+    for (size_t i = 0; i < sizeof(excluded) / sizeof(excluded[0]); ++i) {
+        CHECK(SSL_CTX_set1_groups_list(hybrid, excluded[i]));
+        SSL *client = SSL_new(hybrid);
+        CHECK(client);
+        SSL_set_bio(client, BIO_new(BIO_s_mem()), BIO_new(BIO_s_mem()));
+        SSL_set_connect_state(client);
+        tls_connection *server = NULL;
+        CHECK(tls_connection_create(&server, identity) == 0);
+        unsigned int rejected_flags = 0;
+        int rejected = 0;
+        for (unsigned int step = 0; step < 20000; ++step) {
+            int result = SSL_do_handshake(client);
+            CHECK(result != 1);
+            int error = SSL_get_error(client, result);
+            CHECK(error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE);
+            if (exchange(server, client, &rejected_flags) < 0) { rejected = 1; break; }
+        }
+        CHECK(rejected && (rejected_flags & TLS_FLAG_CLOSED));
+        CHECK(!(rejected_flags & TLS_FLAG_HANDSHAKE));
+        tls_connection_destroy(server);
+        SSL_free(client);
+    }
+    SSL_CTX_free(hybrid);
     tls_connection *broken = NULL;
     CHECK(tls_connection_create(&broken, identity) == 0);
     /* A handshake record containing an illegal first handshake message. */

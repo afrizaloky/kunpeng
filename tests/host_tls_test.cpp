@@ -178,7 +178,9 @@ struct Client {
             exchange();
         }
         CHECK(SSL_get_verify_result(ssl.get()) == X509_V_OK);
-        CHECK(SSL_version(ssl.get()) == TLS1_2_VERSION);
+        CHECK(SSL_version(ssl.get()) == TLS1_3_VERSION);
+        const char* group = SSL_group_to_name(ssl.get(), SSL_get_negotiated_group(ssl.get()));
+        CHECK(group != nullptr && std::string(group) == "X25519MLKEM768");
         constexpr char request[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
         CHECK(SSL_write(ssl.get(), request, sizeof(request) - 1) == sizeof(request) - 1);
         std::string response;
@@ -205,6 +207,9 @@ int main() {
     CHECK(certificate);
     std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> context(SSL_CTX_new(TLS_client_method()), SSL_CTX_free);
     CHECK(context);
+    CHECK(SSL_CTX_set_min_proto_version(context.get(), TLS1_3_VERSION) == 1);
+    CHECK(SSL_CTX_set_max_proto_version(context.get(), TLS1_3_VERSION) == 1);
+    CHECK(SSL_CTX_set1_groups_list(context.get(), "X25519MLKEM768") == 1);
     SSL_CTX_set_verify(context.get(), SSL_VERIFY_PEER, nullptr);
     CHECK(X509_STORE_add_cert(SSL_CTX_get_cert_store(context.get()), certificate.get()) == 1);
     Host running(engine);

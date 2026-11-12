@@ -153,12 +153,18 @@ int tls_identity_create(tls_identity **out, tls_random_fn random, void *context)
     identity->config = SSL_CTX_new_ex(identity->library, NULL, TLS_server_method());
     if (identity->config == NULL ||
         !SSL_CTX_set_min_proto_version(identity->config, TLS1_2_VERSION) ||
-        !SSL_CTX_set_max_proto_version(identity->config, TLS1_2_VERSION) ||
+        !SSL_CTX_set_max_proto_version(identity->config, TLS1_3_VERSION) ||
         !SSL_CTX_set_cipher_list(identity->config, "ECDHE-ECDSA-AES128-GCM-SHA256") ||
-        !SSL_CTX_set1_groups_list(identity->config, "P-256") ||
+        !SSL_CTX_set_ciphersuites(identity->config,
+            "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256") ||
+        !SSL_CTX_set1_groups_list(identity->config,
+            "X25519MLKEM768:SecP256r1MLKEM768:SecP384r1MLKEM1024/"
+            "X25519:X448:P-256:P-384:P-521:ffdhe3072:ffdhe4096:ffdhe6144:ffdhe8192") ||
         !SSL_CTX_use_certificate(identity->config, certificate) ||
         !SSL_CTX_use_PrivateKey(identity->config, key)) { goto done; }
-    SSL_CTX_set_options(identity->config, SSL_OP_NO_TICKET | SSL_OP_NO_RENEGOTIATION);
+    SSL_CTX_set_options(identity->config,
+        SSL_OP_NO_TICKET | SSL_OP_NO_RENEGOTIATION | SSL_OP_CIPHER_SERVER_PREFERENCE);
+    if (!SSL_CTX_set_num_tickets(identity->config, 0)) { goto done; }
     SSL_CTX_set_session_cache_mode(identity->config, SSL_SESS_CACHE_OFF);
     ok = 1;
 done:
