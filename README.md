@@ -153,11 +153,19 @@ curl --cacert /var/tmp/kunpeng-tls-server.pem https://localhost:8443/
 With an OpenSSL 3.5 client, explicitly validate hybrid negotiation and certificate verification (the summary should report TLS 1.3 and `X25519MLKEM768`):
 
 ```sh
-printf 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n' | \
+printf 'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | \
   openssl s_client -connect localhost:8443 -servername localhost \
     -tls1_3 -groups X25519MLKEM768 -CAfile /var/tmp/kunpeng-tls-server.pem \
     -verify_hostname localhost -verify_return_error -no_ign_eof
 ```
+
+The single-request OpenSSL example sends `Connection: close` to request connection termination after the response.
+
+HTTP/1.1 connections are persistent by default for sequential requests. A `close` token in the `Connection` header requests closure after the response; header names and connection tokens are case-insensitive, including `close` within a comma-separated token list. HTTP/1.0 connections close after the response, even when keep-alive is requested. This supports sequential HTTP/1.1 requests, not HTTP/2 or HTTP pipelining.
+
+Only bodyless `GET` requests are supported. `Content-Length` must be absent or occur exactly once with a valid decimal value of zero. Requests with `Transfer-Encoding`, a nonzero or invalid `Content-Length`, or duplicate `Content-Length` headers are rejected and the connection is closed rather than consuming a request body.
+
+Persistent connections do not change the eight-session cap or host deadlines: eight persistent connections hold all eight TA sessions, including while idle, until they close or time out. The default handshake deadline and idle timeout remain 15 seconds each.
 
 The expected response is:
 
@@ -189,7 +197,11 @@ First confirm that the running server returns the expected response. Then run:
 k6 run --summary-mode full tests/load_test.js
 ```
 
-The defaults are 2 virtual users for 30 seconds against `https://localhost:8443/`, using TLS 1.3. Certificate verification is skipped by default for this load test, as requested; this does not authenticate the server. Each request uses a fresh TCP/TLS connection (`noConnectionReuse: true`), and the server also sends `Connection: close`. This is a handshake-load test, not an HTTP keep-alive test.
+The defaults are 2 virtual users for 30 seconds against `https://localhost:8443/`, using TLS 1.3. Certificate verification is skipped by default for this load test, as requested; this does not authenticate the server. `CONNECTION_REUSE` defaults to `true`, setting `noConnectionReuse: false` so k6 can reuse persistent HTTP/1.1 connections for sequential requests. Set `CONNECTION_REUSE=false` for a fresh TCP/TLS connection per request (handshake-load mode):
+
+```sh
+k6 run --summary-mode full -e CONNECTION_REUSE=false tests/load_test.js
+```
 
 ```sh
 k6 run --summary-mode full \
@@ -199,9 +211,9 @@ k6 run --summary-mode full \
   tests/load_test.js
 ```
 
-`VUS`, `DURATION`, `URL`, `TLS_VERSION` (`tls1.2` or `tls1.3`), `P95_MS`, `FAILURE_RATE`, and `INSECURE_SKIP_TLS_VERIFY` are configurable environment inputs. Keep VUs within the host's admitted connection limit for a normal capacity measurement; exceeding it deliberately measures overload/rejections. Requests have a 10-second timeout and do not follow redirects.
+`VUS`, `DURATION`, `URL`, `TLS_VERSION` (`tls1.2` or `tls1.3`), `P95_MS`, `FAILURE_RATE`, `INSECURE_SKIP_TLS_VERIFY`, and `CONNECTION_REUSE` are configurable environment inputs. `CONNECTION_REUSE` accepts only the exact strings `true` and `false`; its inverse sets k6's `noConnectionReuse` option. Keep VUs within the host's admitted connection limit for a normal capacity measurement; exceeding it deliberately measures overload/rejections. Requests have a 10-second timeout and do not follow redirects.
 
-The summary reports p50, p90, p95, and p99 for request duration and TLS handshake timing. All checks must pass: HTTP 200, exact `Hello from the TEE!\n` body, and the requested TLS version. HTTP failures must remain below `FAILURE_RATE`; both request-duration and handshake p95 must remain below `P95_MS` milliseconds. `http_req_duration` excludes connection establishment and TLS negotiation; use `http_req_tls_handshaking` and `iteration_duration` to interpret those costs. Run with `--summary-mode full` to display all timing metrics on k6 versions supporting that option.
+The summary reports p50, p90, p95, and p99 for request duration and TLS handshake timing. All checks must pass: HTTP 200, exact `Hello from the TEE!\n` body, and the requested TLS version. The `FAILURE_RATE` and `P95_MS` threshold expressions remain commented out; only the checks threshold is enabled. `http_req_duration` excludes connection establishment and TLS negotiation; use `http_req_tls_handshaking` and `iteration_duration` to interpret those costs. With connection reuse enabled, requests on an existing connection do not perform a new TLS handshake, so aggregate handshake timings include zero-cost reused requests and are not per-handshake latency measurements. Use `-e CONNECTION_REUSE=false` to measure fresh-handshake load and compare it separately with reused-connection request timing. Run with `--summary-mode full` to display all timing metrics on k6 versions supporting that option.
 
 To enable certificate verification on Linux:
 

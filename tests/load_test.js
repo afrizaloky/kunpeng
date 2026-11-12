@@ -43,13 +43,19 @@ if (insecureText !== 'true' && insecureText !== 'false') {
   throw new TypeError('INSECURE_SKIP_TLS_VERIFY must be true or false');
 }
 
+const reuseText = __ENV.CONNECTION_REUSE ?? 'true';
+if (reuseText !== 'true' && reuseText !== 'false') {
+  throw new TypeError('CONNECTION_REUSE must be true or false');
+}
+const reuse = reuseText === 'true';
+
 // vus + duration use k6's constant-vus shortcut and retain CLI option precedence.
 export const options = {
   vus,
   duration: __ENV.DURATION ?? '30s',
   tlsVersion: { min: tlsVersion, max: tlsVersion },
   insecureSkipTLSVerify: insecureText === 'true',
-  noConnectionReuse: true,
+  noConnectionReuse: !reuse,
   maxRedirects: 0,
   summaryTrendStats: ['avg', 'min', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'max', 'count'],
   thresholds: {
