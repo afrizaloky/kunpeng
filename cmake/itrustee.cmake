@@ -9,7 +9,8 @@ if(NOT _compiler_headers_result EQUAL 0 OR NOT IS_DIRECTORY "${_compiler_headers
 endif()
 set(_musl "${ITRUSTEE_SDK}/thirdparty/open_source/musl/libc")
 set(_script "${ITRUSTEE_SDK}/build/tools/ta_link_64.ld")
-foreach(required "${_musl}/stdlib.h" "${_script}" "${ITRUSTEE_SDK}/include/TA/tee_crypto_api.h")
+foreach(required "${_musl}/stdlib.h" "${_script}" "${ITRUSTEE_SDK}/include/TA/tee_crypto_api.h"
+    "${ITRUSTEE_SDK}/include/TA/huawei_ext/tee_log.h")
   if(NOT EXISTS "${required}")
     message(FATAL_ERROR "Missing SDK input: ${required}")
   endif()
@@ -28,7 +29,9 @@ target_compile_options(itrustee_trusted INTERFACE -nostdinc -march=armv8-a -Os
 foreach(lib tls_engine)
   target_link_libraries(${lib} PRIVATE itrustee_trusted)
 endforeach()
+target_compile_definitions(tls_engine PRIVATE KUNPENG_ITRUSTEE)
 add_library(tls_ta SHARED ta/tls_ta.c ta/openssl_platform.c)
+target_compile_definitions(tls_ta PRIVATE KUNPENG_ITRUSTEE)
 target_compile_options(tls_ta PRIVATE -mno-outline-atomics)
 execute_process(COMMAND "${CMAKE_C_COMPILER}" -print-libgcc-file-name
   OUTPUT_VARIABLE _libgcc OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)

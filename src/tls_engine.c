@@ -14,6 +14,23 @@
 #error "The trusted random provider requires OpenSSL 3.5 or newer"
 #endif
 
+#ifdef KUNPENG_ITRUSTEE
+#include <tee_log.h>
+
+/* Only public stages and packed error codes: never error data or source metadata. */
+static void tls_engine_log_error(const char *stage)
+{
+    unsigned long error = ERR_get_error();
+    tloge("tls-engine failure stage=%s openssl=0x%lx\n", stage, error);
+    while ((error = ERR_get_error()) != 0) {
+        tloge("tls-engine failure stage=%s openssl=0x%lx\n", stage, error);
+    }
+}
+#define TLS_ENGINE_LOG_ERROR(stage) tls_engine_log_error(stage)
+#else
+#define TLS_ENGINE_LOG_ERROR(stage) ((void)(stage))
+#endif
+
 #define ENGINE_INVALID (-1)
 #define ENGINE_BOUNDS (-2)
 #define ENGINE_HTTP (-3)
@@ -104,29 +121,44 @@ int tls_identity_create(tls_identity **out, tls_random_fn random, void *context)
     BIGNUM *number = NULL;
     unsigned char serial[16];
     int ok = 0;
+    const char *stage = "identity-allocation";
     if (out == NULL) { return ENGINE_INVALID; }
     *out = NULL;
     if (random == NULL) { return ENGINE_INVALID; }
     identity = calloc(1, sizeof(*identity));
-    if (identity == NULL) { return ENGINE_TLS; }
+    if (identity == NULL) { TLS_ENGINE_LOG_ERROR(stage); return ENGINE_TLS; }
     identity->random = random;
     identity->random_context = context;
+    stage = "library-context";
     identity->library = OSSL_LIB_CTX_new();
-    if (identity->library == NULL ||
-        !OSSL_PROVIDER_add_builtin(identity->library, "trusted-random", random_provider_init)) { goto done; }
+    if (identity->library == NULL) { goto done; }
+    stage = "random-provider-register";
+    if (!OSSL_PROVIDER_add_builtin(identity->library, "trusted-random", random_provider_init)) { goto done; }
+    stage = "random-provider-load";
     identity->provider = OSSL_PROVIDER_load(identity->library, "trusted-random");
     if (identity->provider == NULL) { goto done; }
     *(tls_identity **)OSSL_PROVIDER_get0_provider_ctx(identity->provider) = identity;
+    stage = "random-provider-select";
     if (!RAND_set1_random_provider(identity->library, identity->provider)) { goto done; }
+    stage = "default-provider-load";
     identity->defaults = OSSL_PROVIDER_load(identity->library, "default");
     if (identity->defaults == NULL) { goto done; }
+    stage = "keygen";
     key = EVP_PKEY_Q_keygen(identity->library, NULL, "EC", "prime256v1");
     certificate = X509_new_ex(identity->library, NULL);
     signer = EVP_MD_CTX_new();
     pem = BIO_new(BIO_s_mem());
-    if (key == NULL || certificate == NULL || signer == NULL || pem == NULL ||
-        !RAND_bytes_ex(identity->library, serial, sizeof(serial), 128)) { goto done; }
+    if (key == NULL) { goto done; }
+    stage = "certificate-allocation";
+    if (certificate == NULL) { goto done; }
+    stage = "signer-allocation";
+    if (signer == NULL) { goto done; }
+    stage = "pem-allocation";
+    if (pem == NULL) { goto done; }
+    stage = "serial-random";
+    if (!RAND_bytes_ex(identity->library, serial, sizeof(serial), 128)) { goto done; }
     serial[0] = (unsigned char)((serial[0] & 0x7fu) | 1u);
+    stage = "certificate-fields";
     number = BN_bin2bn(serial, sizeof(serial), NULL);
     if (number == NULL || !BN_to_ASN1_INTEGER(number, X509_get_serialNumber(certificate)) ||
         !X509_set_version(certificate, 2) || !X509_set_pubkey(certificate, key) ||
@@ -137,6 +169,7 @@ int tls_identity_create(tls_identity **out, tls_random_fn random, void *context)
         !X509_set_issuer_name(certificate, X509_get_subject_name(certificate))) { goto done; }
     const int extensions[] = { NID_basic_constraints, NID_key_usage, NID_subject_alt_name };
     const char *values[] = { "critical,CA:FALSE", "critical,digitalSignature", "DNS:localhost" };
+    stage = "certificate-extensions";
     for (size_t i = 0; i < 3; ++i) {
         X509_EXTENSION *extension = X509V3_EXT_conf_nid(NULL, NULL, extensions[i], values[i]);
         if (extension == NULL) { goto done; }
@@ -144,30 +177,42 @@ int tls_identity_create(tls_identity **out, tls_random_fn random, void *context)
         X509_EXTENSION_free(extension);
         if (!added) { goto done; }
     }
+    stage = "certificate-sign-pem";
     if (!EVP_DigestSignInit_ex(signer, NULL, "SHA256", identity->library, NULL, key, NULL) ||
         !X509_sign_ctx(certificate, signer) || !PEM_write_bio_X509(pem, certificate)) { goto done; }
+    stage = "certificate-export";
     size_t length = BIO_ctrl_pending(pem);
     if (length >= sizeof(identity->pem) ||
         BIO_read(pem, identity->pem, (int)length) != (int)length) { goto done; }
     identity->pem_size = length + 1;
+    stage = "ssl-context";
     identity->config = SSL_CTX_new_ex(identity->library, NULL, TLS_server_method());
-    if (identity->config == NULL ||
-        !SSL_CTX_set_min_proto_version(identity->config, TLS1_2_VERSION) ||
-        !SSL_CTX_set_max_proto_version(identity->config, TLS1_3_VERSION) ||
-        !SSL_CTX_set_cipher_list(identity->config, "ECDHE-ECDSA-AES128-GCM-SHA256") ||
-        !SSL_CTX_set_ciphersuites(identity->config,
-            "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256") ||
-        !SSL_CTX_set1_groups_list(identity->config,
+    if (identity->config == NULL) { goto done; }
+    stage = "tls-min-version";
+    if (!SSL_CTX_set_min_proto_version(identity->config, TLS1_2_VERSION)) { goto done; }
+    stage = "tls-max-version";
+    if (!SSL_CTX_set_max_proto_version(identity->config, TLS1_3_VERSION)) { goto done; }
+    stage = "tls12-ciphers";
+    if (!SSL_CTX_set_cipher_list(identity->config, "ECDHE-ECDSA-AES128-GCM-SHA256")) { goto done; }
+    stage = "tls13-ciphers";
+    if (!SSL_CTX_set_ciphersuites(identity->config,
+            "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256")) { goto done; }
+    stage = "tls-groups";
+    if (!SSL_CTX_set1_groups_list(identity->config,
             "X25519MLKEM768:SecP256r1MLKEM768:SecP384r1MLKEM1024/"
-            "X25519:X448:P-256:P-384:P-521:ffdhe3072:ffdhe4096:ffdhe6144:ffdhe8192") ||
-        !SSL_CTX_use_certificate(identity->config, certificate) ||
-        !SSL_CTX_use_PrivateKey(identity->config, key)) { goto done; }
+            "X25519:X448:P-256:P-384:P-521:ffdhe3072:ffdhe4096:ffdhe6144:ffdhe8192")) { goto done; }
+    stage = "certificate-install";
+    if (!SSL_CTX_use_certificate(identity->config, certificate)) { goto done; }
+    stage = "key-install";
+    if (!SSL_CTX_use_PrivateKey(identity->config, key)) { goto done; }
     SSL_CTX_set_options(identity->config,
         SSL_OP_NO_TICKET | SSL_OP_NO_RENEGOTIATION | SSL_OP_CIPHER_SERVER_PREFERENCE);
+    stage = "ticket-count";
     if (!SSL_CTX_set_num_tickets(identity->config, 0)) { goto done; }
     SSL_CTX_set_session_cache_mode(identity->config, SSL_SESS_CACHE_OFF);
     ok = 1;
 done:
+    if (!ok) { TLS_ENGINE_LOG_ERROR(stage); }
     OPENSSL_cleanse(serial, sizeof(serial));
     BN_free(number);
     BIO_free(pem);
@@ -209,11 +254,19 @@ int tls_connection_create(tls_connection **out, tls_identity *identity)
     *out = NULL;
     if (identity == NULL) { return ENGINE_INVALID; }
     connection = calloc(1, sizeof(*connection));
-    if (connection == NULL) { return ENGINE_TLS; }
+    if (connection == NULL) {
+        TLS_ENGINE_LOG_ERROR("connection-allocation");
+        return ENGINE_TLS;
+    }
     connection->ssl = SSL_new(identity->config);
-    if (connection->ssl == NULL ||
-        !BIO_new_bio_pair(&transport, TLS_ENGINE_TEST_BIO_CAPACITY,
+    if (connection->ssl == NULL) {
+        TLS_ENGINE_LOG_ERROR("connection-ssl");
+        tls_connection_destroy(connection);
+        return ENGINE_TLS;
+    }
+    if (!BIO_new_bio_pair(&transport, TLS_ENGINE_TEST_BIO_CAPACITY,
                           &connection->network, TLS_IO_CAPACITY)) {
+        TLS_ENGINE_LOG_ERROR("connection-bio-pair");
         tls_connection_destroy(connection);
         return ENGINE_TLS;
     }
