@@ -38,6 +38,7 @@ execute_process(COMMAND "${CMAKE_C_COMPILER}" -print-libgcc-file-name
 target_link_libraries(tls_ta PRIVATE tls_engine OpenSSL::SSL OpenSSL::Crypto "${_libgcc}")
 target_link_libraries(tls_ta PRIVATE tls_engine itrustee_trusted)
 target_link_options(tls_ta PRIVATE -nostdlib -shared "-Wl,-T,${_script}"
+  "-Wl,--exclude-libs=libssl.a:libcrypto.a"
   -Wl,-z,text,-z,now,-z,relro,-z,noexecstack,-z,max-page-size=0x1000,-z,common-page-size=0x1000)
 set_target_properties(tls_ta PROPERTIES OUTPUT_NAME combine LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ta/unsigned")
 configure_file(ta/manifest.txt ta/unsigned/manifest.txt COPYONLY)
