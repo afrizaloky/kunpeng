@@ -6,8 +6,8 @@ if(POLICY CMP0135)
 endif()
 set(_ossl "${CMAKE_BINARY_DIR}/openssl-ta")
 FetchContent_Declare(openssl_source
-  URL https://www.openssl.org/source/openssl-3.5.0.tar.gz
-  URL_HASH SHA256=344d0a79f1a9b08029b0744e2cc401a43f9c90acd1044d09a530b4885a8e9fc0
+  URL https://www.openssl.org/source/openssl-3.5.9.tar.gz
+  URL_HASH SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
   SOURCE_SUBDIR cmake-does-not-exist)
 FetchContent_GetProperties(openssl_source)
 if(NOT openssl_source_POPULATED)
@@ -40,7 +40,7 @@ foreach(_name SSL Crypto)
   add_library(OpenSSL::${_name} STATIC IMPORTED GLOBAL)
   set_target_properties(OpenSSL::${_name} PROPERTIES
     IMPORTED_LOCATION "${_ossl}/build/lib${_lower}.a"
-    INTERFACE_INCLUDE_DIRECTORIES "${_ossl}/build/include;${_ossl}/source/include")
+    INTERFACE_INCLUDE_DIRECTORIES "${_ossl}/build/include;${_openssl_source}/include")
   add_dependencies(OpenSSL::${_name} openssl_ta_build)
 endforeach()
 set_property(TARGET OpenSSL::SSL PROPERTY INTERFACE_LINK_LIBRARIES OpenSSL::Crypto)
