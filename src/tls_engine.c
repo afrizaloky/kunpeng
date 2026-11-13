@@ -228,10 +228,9 @@ int tls_identity_create(tls_identity **out, tls_random_fn random, void *context)
     stage = "tls13-ciphers";
     if (!SSL_CTX_set_ciphersuites(identity->config,
             "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256")) { goto done; }
-    char const* AVAILABLE_GROUPS =
-            "p521_mlkem1024:SecP384r1MLKEM1024:X25519MLKEM768:x448_mlkem768:p384_mlkem768:SecP256r1MLKEM768:"
-            "x25519_mlkem512:p256_mlkem512:mlkem1024:mlkem768:mlkem512:"
-            "x25519:prime256v1:secp384r1:secp521r1:X448:ffdhe2048:ffdhe3072:ffdhe4096:ffdhe6144:ffdhe8192";
+    const char *AVAILABLE_GROUPS =
+            "X25519MLKEM768:SecP256r1MLKEM768:SecP384r1MLKEM1024/"
+            "X25519:X448:P-256:P-384:P-521:ffdhe3072:ffdhe4096:ffdhe6144:ffdhe8192";
     stage = "tls-groups";
     if (!SSL_CTX_set1_groups_list(identity->config, AVAILABLE_GROUPS)) { goto done; }
     stage = "certificate-install";
