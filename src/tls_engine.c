@@ -139,6 +139,9 @@ int tls_identity_create(tls_identity **out, tls_random_fn random, void *context)
     if (identity == NULL) { TLS_ENGINE_LOG_ERROR(stage); return ENGINE_TLS; }
     identity->random = random;
     identity->random_context = context;
+#ifdef KUNPENG_ITRUSTEE
+    tlogi("tls-engine startup openssl=%s\n", OpenSSL_version(OPENSSL_VERSION));
+#endif
     stage = "library-context";
     identity->library = OSSL_LIB_CTX_new();
     if (identity->library == NULL) { goto done; }
@@ -202,6 +205,24 @@ int tls_identity_create(tls_identity **out, tls_random_fn random, void *context)
     if (!SSL_CTX_set_min_proto_version(identity->config, TLS1_2_VERSION)) { goto done; }
     stage = "tls-max-version";
     if (!SSL_CTX_set_max_proto_version(identity->config, TLS1_3_VERSION)) { goto done; }
+#ifdef KUNPENG_ITRUSTEE
+    STACK_OF(OPENSSL_CSTRING) *groups = sk_OPENSSL_CSTRING_new_null();
+    if (groups == NULL) {
+        TLS_ENGINE_LOG_ERROR("implemented-groups-allocation");
+    } else {
+        if (!SSL_CTX_get0_implemented_groups(identity->config, 0, groups)) {
+            TLS_ENGINE_LOG_ERROR("implemented-groups-enumeration");
+        } else {
+            const int count = sk_OPENSSL_CSTRING_num(groups);
+            tlogi("tls-engine implemented-groups count=%d\n", count);
+            for (int i = 0; i < count; ++i) {
+                tlogi("tls-engine implemented-group name=%s\n",
+                      sk_OPENSSL_CSTRING_value(groups, i));
+            }
+        }
+        sk_OPENSSL_CSTRING_free(groups);
+    }
+#endif
     stage = "tls12-ciphers";
     if (!SSL_CTX_set_cipher_list(identity->config, "ECDHE-ECDSA-AES128-GCM-SHA256")) { goto done; }
     stage = "tls13-ciphers";
